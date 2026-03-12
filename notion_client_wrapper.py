@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_CALENDAR_DB = os.environ.get("NOTION_CALENDAR_DB")
 NOTION_CONTACTS_DB = os.environ.get("NOTION_CONTACTS_DB")
-TIMEZONE_OFFSET = int(os.environ.get("TIMEZONE_OFFSET", "-7"))  # Default to PT
+TIMEZONE_OFFSET = int(os.environ.get("TIMEZONE_OFFSET", "-5"))  # Default to ET
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -21,10 +21,10 @@ HEADERS = {
 def get_todays_events() -> list:
     """Query Notion calendar for today's events."""
     try:
-        # Get today's date range in local time
+        # Get today's date as YYYY-MM-DD in local time
         now = datetime.now(timezone(timedelta(hours=TIMEZONE_OFFSET)))
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        today_end = now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+        today = now.strftime("%Y-%m-%d")
+        logger.info(f"Querying Notion for events on: {today}")
 
         response = httpx.post(
             f"https://api.notion.com/v1/databases/{NOTION_CALENDAR_DB}/query",
@@ -33,8 +33,7 @@ def get_todays_events() -> list:
                 "filter": {
                     "property": "Scheduled",
                     "date": {
-                        "on_or_after": today_start,
-                        "on_or_before": today_end
+                        "equals": today
                     }
                 }
             },
