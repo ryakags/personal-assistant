@@ -170,7 +170,7 @@ def nightly_recap():
         logger.error(f"Error in nightly recap: {e}", exc_info=True)
 
 
-@app.route("/trigger-recap", methods=["POST"])
+@app.route("/trigger-recap", methods=["GET", "POST"])
 def trigger_recap():
     """Manual trigger endpoint for testing."""
     nightly_recap()
