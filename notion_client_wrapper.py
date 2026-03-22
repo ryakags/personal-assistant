@@ -21,7 +21,6 @@ HEADERS = {
 def get_todays_events() -> list:
     """Query Notion calendar for today's events."""
     try:
-        # Get today's date as YYYY-MM-DD in local time
         now = datetime.now(timezone(timedelta(hours=TIMEZONE_OFFSET)))
         today = now.strftime("%Y-%m-%d")
         logger.info(f"Querying Notion for events on: {today}")
@@ -29,14 +28,7 @@ def get_todays_events() -> list:
         response = httpx.post(
             f"https://api.notion.com/v1/databases/{NOTION_CALENDAR_DB}/query",
             headers=HEADERS,
-            json={
-                "filter": {
-                    "property": "Scheduled",
-                    "date": {
-                        "equals": today
-                    }
-                }
-            },
+            json={"filter": {"property": "Scheduled", "date": {"equals": today}}},
             timeout=15
         )
         response.raise_for_status()
@@ -50,7 +42,6 @@ def get_todays_events() -> list:
             workout = _get_multi_select(props, "Workout")
             people_relation = props.get("People Involved", {}).get("relation", [])
 
-            # Resolve contact names and IDs
             contacts = []
             for rel in people_relation:
                 contact_id = rel.get("id", "")
@@ -76,57 +67,26 @@ def get_todays_events() -> list:
 
 
 def update_event_notes(page_id: str, summary: str, followups: list) -> bool:
-    """Update the Notes property and append a summary block to the event page."""
+    """Update the Notes property on the event page."""
     try:
-        # Update Notes property
+        full_note = summary
+        if followups:
+            full_note += "\n\n📌 Follow-ups: " + " | ".join(followups)
+
         httpx.patch(
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=HEADERS,
             json={
                 "properties": {
                     "Notes": {
-                        "rich_text": [{"type": "text", "text": {"content": summary}}]
+                        "rich_text": [{"type": "text", "text": {"content": full_note}}]
                     }
                 }
             },
             timeout=10
         ).raise_for_status()
 
-        # Append summary block to page content
-        blocks = [
-            {
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {
-                    "rich_text": [{"type": "text", "text": {"content": f"Recap — {datetime.now().strftime('%B %d, %Y')}"}}]
-                }
-            },
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{"type": "text", "text": {"content": summary}}]
-                }
-            }
-        ]
-
-        if followups:
-            blocks.append({
-                "object": "block",
-                "type": "callout",
-                "callout": {
-                    "rich_text": [{"type": "text", "text": {"content": "Follow-ups: " + " | ".join(followups)}}],
-                    "icon": {"emoji": "📌"}
-                }
-            })
-
-        httpx.patch(
-            f"https://api.notion.com/v1/blocks/{page_id}/children",
-            headers=HEADERS,
-            json={"children": blocks},
-            timeout=10
-        ).raise_for_status()
-
+        logger.info(f"Updated event notes for {page_id}")
         return True
     except Exception as e:
         logger.error(f"Failed to update event notes: {e}", exc_info=True)
@@ -134,51 +94,50 @@ def update_event_notes(page_id: str, summary: str, followups: list) -> bool:
 
 
 def update_contact(page_id: str, name: str, summary: str, followups: list, event_title: str) -> bool:
-    """Update a contact's Last Seen date and append interaction notes."""
+    """Update a contact's Last Seen date and replace the Last Seen recap block."""
     try:
         today = datetime.now().strftime("%Y-%m-%d")
+        date_label = datetime.now().strftime("%B %d, %Y")
 
         # Update Last Seen property
         httpx.patch(
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=HEADERS,
-            json={
-                "properties": {
-                    "Last Seen": {
-                        "date": {"start": today}
-                    }
-                }
-            },
+            json={"properties": {"Last Seen": {"date": {"start": today}}}},
             timeout=10
         ).raise_for_status()
 
-        # Append interaction block to contact page
+        # Delete existing blocks so we replace instead of append
+        _clear_page_blocks(page_id)
+
+        # Build the new Last Seen recap block
+        full_summary = summary
+        if followups:
+            full_summary += "\n\n📌 Follow-up: " + " | ".join(followups)
+
         blocks = [
             {
                 "object": "block",
                 "type": "heading_3",
                 "heading_3": {
-                    "rich_text": [{"type": "text", "text": {"content": f"{datetime.now().strftime('%B %d, %Y')} — {event_title}"}}]
+                    "rich_text": [{"type": "text", "text": {"content": f"Last Seen — {date_label}"}}]
                 }
             },
             {
                 "object": "block",
                 "type": "paragraph",
                 "paragraph": {
-                    "rich_text": [{"type": "text", "text": {"content": summary}}]
+                    "rich_text": [{"type": "text", "text": {"content": f"{event_title}"}}]
+                }
+            },
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"type": "text", "text": {"content": full_summary}}]
                 }
             }
         ]
-
-        if followups:
-            blocks.append({
-                "object": "block",
-                "type": "callout",
-                "callout": {
-                    "rich_text": [{"type": "text", "text": {"content": "→ Follow-up: " + " | ".join(followups)}}],
-                    "icon": {"emoji": "📌"}
-                }
-            })
 
         httpx.patch(
             f"https://api.notion.com/v1/blocks/{page_id}/children",
@@ -187,10 +146,34 @@ def update_contact(page_id: str, name: str, summary: str, followups: list, event
             timeout=10
         ).raise_for_status()
 
+        logger.info(f"Updated contact {name} ({page_id})")
         return True
     except Exception as e:
         logger.error(f"Failed to update contact {name}: {e}", exc_info=True)
         return False
+
+
+def _clear_page_blocks(page_id: str):
+    """Delete all existing blocks on a page."""
+    try:
+        response = httpx.get(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=HEADERS,
+            timeout=10
+        )
+        response.raise_for_status()
+        blocks = response.json().get("results", [])
+
+        for block in blocks:
+            block_id = block.get("id")
+            if block_id:
+                httpx.delete(
+                    f"https://api.notion.com/v1/blocks/{block_id}",
+                    headers=HEADERS,
+                    timeout=10
+                )
+    except Exception as e:
+        logger.error(f"Failed to clear blocks for {page_id}: {e}")
 
 
 def _get_title(props: dict) -> str:
