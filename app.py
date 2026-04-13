@@ -1,10 +1,9 @@
 import os
 import json
 import logging
+import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-
-from telegram_client import send_message
 from supabase_client import get_active_session, create_session, update_session, close_session
 from notion_client_wrapper import get_todays_events, update_event_notes, update_contact
 from claude_client import get_claude_response
@@ -14,7 +13,61 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# Your personal number — only respond to messages from this number
+MY_NUMBER = os.environ.get("MY_PHONE_NUMBER", "+19168331436")
+
+# BlueBubbles server config
+BLUEBUBBLES_URL = os.environ.get("BLUEBUBBLES_URL", "http://localhost:1234")
+BLUEBUBBLES_PASSWORD = os.environ.get("BLUEBUBBLES_PASSWORD", "")
+
+
+def send_message(chat_guid: str, text: str):
+    """Send an iMessage reply via BlueBubbles REST API."""
+    url = f"{BLUEBUBBLES_URL}/api/v1/message/text"
+    payload = {
+        "chatGuid": chat_guid,
+        "tempGuid": f"temp-{datetime.now().timestamp()}",
+        "message": text,
+        "method": "private-api"
+    }
+    params = {"password": BLUEBUBBLES_PASSWORD}
+    try:
+        response = requests.post(url, json=payload, params=params, timeout=10)
+        response.raise_for_status()
+        logger.info(f"Message sent to {chat_guid}")
+    except Exception as e:
+        logger.error(f"Failed to send message via BlueBubbles: {e}", exc_info=True)
+
+
+def extract_sender_number(data: dict) -> str | None:
+    """Extract the sender's phone number from a BlueBubbles webhook payload."""
+    try:
+        message = data.get("data", {})
+        handle = message.get("handle", {})
+        return handle.get("address", "")
+    except Exception:
+        return None
+
+
+def extract_message_text(data: dict) -> str | None:
+    """Extract the message text from a BlueBubbles webhook payload."""
+    try:
+        message = data.get("data", {})
+        return message.get("text", "").strip()
+    except Exception:
+        return None
+
+
+def extract_chat_guid(data: dict) -> str | None:
+    """Extract the chat GUID from a BlueBubbles webhook payload."""
+    try:
+        message = data.get("data", {})
+        chats = message.get("chats", [])
+        if chats:
+            return chats[0].get("guid", "")
+        return None
+    except Exception:
+        return None
 
 
 @app.route("/webhook", methods=["POST"])
@@ -22,30 +75,48 @@ def webhook():
     data = request.json
     logger.info(f"Incoming webhook: {json.dumps(data)}")
 
-    message = data.get("message", {})
-    if not message:
+    # Only handle new incoming messages
+    event_type = data.get("type", "")
+    if event_type != "new-message":
         return jsonify({"ok": True})
 
-    chat_id = str(message.get("chat", {}).get("id", ""))
-    text = message.get("text", "").strip()
+    message = data.get("data", {})
 
-    if not chat_id or not text:
+    # Ignore outgoing messages (ones Rocky sent)
+    if message.get("isFromMe", False):
+        return jsonify({"ok": True})
+
+    # Ignore reactions, read receipts, attachments-only messages
+    text = extract_message_text(data)
+    if not text:
+        return jsonify({"ok": True})
+
+    # Only respond to messages from your personal number
+    sender = extract_sender_number(data)
+    if not sender or sender != MY_NUMBER:
+        logger.info(f"Ignoring message from unknown sender: {sender}")
+        return jsonify({"ok": True})
+
+    chat_guid = extract_chat_guid(data)
+    if not chat_guid:
+        logger.error("Could not extract chat GUID from payload")
         return jsonify({"ok": True})
 
     try:
-        handle_message(chat_id, text)
+        handle_message(chat_guid, sender, text)
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
-        send_message(chat_id, "Sorry, something went wrong. Please try again.")
+        send_message(chat_guid, "Sorry, something went wrong. Please try again.")
 
     return jsonify({"ok": True})
 
 
-def handle_message(chat_id: str, text: str):
-    session = get_active_session(chat_id)
+def handle_message(chat_guid: str, sender: str, text: str):
+    # Use sender number as the session key (replaces Telegram chat_id)
+    session = get_active_session(sender)
 
     if not session:
-        send_message(chat_id, "No active recap session. I'll message you tonight at 10pm!")
+        send_message(chat_guid, "No active recap session. I'll message you tonight at 10pm!")
         return
 
     events = session["events"]
@@ -53,14 +124,14 @@ def handle_message(chat_id: str, text: str):
     history = session["conversation_history"] or []
 
     if current_index >= len(events):
-        send_message(chat_id, "You've recapped all your events for today. Great job! 🎉")
+        send_message(chat_guid, "You've recapped all your events for today. Great job! 🎉")
         close_session(session["id"])
         return
 
     current_event = events[current_index]
     history.append({"role": "user", "content": text})
 
-    system_prompt = f"""You are a warm, conversational personal assistant helping the user recap their day over Telegram.
+    system_prompt = f"""You are a warm, conversational personal assistant helping the user recap their day over iMessage.
 
 You are currently discussing this calendar event:
 - Title: {current_event.get('title', 'Unknown event')}
@@ -73,7 +144,7 @@ QUESTIONING RULES:
 - Ask a MAXIMUM of 2-3 follow-up questions total across the whole conversation
 - Always number your questions like: "1. How did it go?\n2. Any follow-ups needed?"
 - Ask all your questions in one message — never one question at a time
-- Keep messages short and conversational — this is Telegram, not email
+- Keep messages short and conversational — this is iMessage, not email
 
 WHEN TO WRAP UP:
 - After the user has answered 1-2 rounds of questions, you have enough info — wrap up
@@ -87,9 +158,14 @@ SUMMARY FORMAT:
 When you have enough info, respond with ONLY this exact JSON (no other text):
 {{"done": true, "summary": "• Bullet one\n• Bullet two\n• Bullet three", "followups": ["follow-up action if any"], "next_message": "Short friendly transition message"}}
 
-The summary field must use bullet points with the • character and \n between each bullet."""
+The summary field must use bullet points with the • character and \\n between each bullet."""
 
-    response_text = get_claude_response(system_prompt, history)
+    # Model routing: Haiku for short messages, Sonnet for longer/complex ones
+    word_count = len(text.split())
+    model = "claude-haiku-4-5" if word_count < 50 else "claude-sonnet-4-6"
+    logger.info(f"Routing to {model} (word count: {word_count})")
+
+    response_text = get_claude_response(system_prompt, history, model=model)
 
     # Try to parse as done JSON
     try:
@@ -119,31 +195,27 @@ The summary field must use bullet points with the • character and \n between e
                     "conversation_history": []
                 })
 
-                send_message(chat_id, next_message)
+                send_message(chat_guid, next_message)
 
                 if new_index < len(events):
                     next_event = events[new_index]
-                    send_message(chat_id, f"Next up: *{next_event['title']}*. What happened?")
+                    send_message(chat_guid, f"Next up: {next_event['title']}. What happened?")
                 else:
-                    send_message(chat_id, "That's all your events for today. Great recap! 🎉")
+                    send_message(chat_guid, "That's all your events for today. Great recap! 🎉")
                     close_session(session["id"])
-
                 return
+
     except (json.JSONDecodeError, ValueError):
         pass
 
     history.append({"role": "assistant", "content": response_text})
     update_session(session["id"], {"conversation_history": history})
-    send_message(chat_id, response_text)
+    send_message(chat_guid, response_text)
 
 
 def nightly_recap():
     """Triggered externally via cron-job.org hitting /trigger-recap."""
     logger.info("Running nightly recap trigger...")
-
-    if not TELEGRAM_CHAT_ID:
-        logger.error("TELEGRAM_CHAT_ID not set")
-        return
 
     try:
         events = get_todays_events()
@@ -151,16 +223,19 @@ def nightly_recap():
             logger.info("No events today, skipping recap.")
             return
 
-        create_session(TELEGRAM_CHAT_ID, events)
+        create_session(MY_NUMBER, events)
 
         event_titles = [e["title"] for e in events]
         if len(event_titles) == 1:
-            intro = f"Hey! You had *{event_titles[0]}* today."
+            intro = f"Hey! You had {event_titles[0]} today."
         else:
-            listed = ", ".join(f"*{t}*" for t in event_titles[:-1]) + f" and *{event_titles[-1]}*"
+            listed = ", ".join(event_titles[:-1]) + f" and {event_titles[-1]}"
             intro = f"Hey! You had {listed} today."
 
-        send_message(TELEGRAM_CHAT_ID, f"{intro}\n\nLet's do a quick recap. What happened during *{event_titles[0]}*?")
+        # Get the chat GUID for your number to send the opening message
+        # BlueBubbles uses iMessage:+1XXXXXXXXXX format for 1:1 chats
+        chat_guid = f"iMessage;-;{MY_NUMBER}"
+        send_message(chat_guid, f"{intro}\n\nLet's do a quick recap. What happened during {event_titles[0]}?")
 
     except Exception as e:
         logger.error(f"Error in nightly recap: {e}", exc_info=True)
