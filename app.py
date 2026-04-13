@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Your personal number — only respond to messages from this number
-MY_NUMBER = os.environ.get("MY_PHONE_NUMBER", "+19168331436")
+MY_NUMBER = "+19168331436"
 
 # BlueBubbles server config
 BLUEBUBBLES_URL = os.environ.get("BLUEBUBBLES_URL", "http://localhost:1234")
