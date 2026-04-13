@@ -4,7 +4,7 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-from notion_client_wrapper import search_events, write_event_notes
+from notion_client_wrapper import search_events, write_event_notes, create_calendar_event
 from claude_client import get_claude_response
 
 logging.basicConfig(level=logging.INFO)
@@ -16,34 +16,56 @@ MY_NUMBER = "+19168331436"
 BLUEBUBBLES_URL = os.environ.get("BLUEBUBBLES_URL", "http://localhost:1234")
 BLUEBUBBLES_PASSWORD = os.environ.get("BLUEBUBBLES_PASSWORD", "")
 
-# In-memory session store: { phone_number: session_dict }
-# session_dict keys: event, history, state ("reviewing" | None)
 sessions = {}
 
 SYSTEM_PROMPT = """You are Rocky, a personal AI assistant available over iMessage. You are helpful, concise, and conversational — this is iMessage, not email. Keep responses short and punchy. You can help with anything: questions, drafting, thinking through problems, recommendations, math, etc.
 
-You also have access to the user's Notion calendar. When the user wants to review or recap a past activity, you will be given details about the event and asked to conduct the review."""
+You also have access to the user's Notion calendar. When the user wants to review a past activity or add something to their calendar, you will handle that."""
 
-INTENT_PROMPT = """You are analyzing a message to determine if the user wants to review/recap a past calendar event.
+INTENT_PROMPT = """You are analyzing a message to determine the user's intent.
 
 Return a JSON object with:
-- "is_review": true/false — whether they want to review an event
-- "date": ISO date string like "2026-04-13" or null if today/recent
-- "event_type": one of the Notion event types or null (e.g. "Exercise", "Dinner", "Lunch", "Coffee", "Meeting", "Workout")
-- "name_query": a partial name to search for, or null
-- "days_back": how many days back to search (default 1)
+- "intent": one of "review", "add_to_calendar", or "general"
+- "date": ISO date string like "2026-04-13" or null
+- "event_type": Notion event type or null (e.g. "Exercise", "Dinner", "Lunch", "Coffee", "Meeting")
+- "name_query": partial name to search for, or null
+- "days_back": how many days back to search (default 1, for review intent only)
 
-Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation, Lunch, Party, Coffee, FaceTime, Happy Hour, Sports, Wedding, Festival, Work, Food, Remote Work Trip, Haircut, Movie, Coffee Club, Podcast, Appointment, Art, Date, Comedy Show, Basketball, Therapy, Notes & Food Planning, Birthday, Drinks, Hangout, Grocery, Laundry, Beach, Airport, Speaker Event, Open Mic, Errand, Breakfast, Cowork, Cultural Event, Volunteering, Sick, Music, Art Show, Doctors, Pop Up, Canceled, Bars, Project Work, Travel, Brunch, Self Care, Theater, Trivia, Meeting, Broadway
+Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation, Lunch, Party, Coffee, FaceTime, Happy Hour, Sports, Wedding, Festival, Work, Food, Remote Work Trip, Haircut, Movie, Coffee Club, Podcast, Appointment, Art, Date, Comedy Show, Basketball, Therapy, Birthday, Drinks, Hangout, Grocery, Laundry, Beach, Airport, Speaker Event, Open Mic, Errand, Breakfast, Cowork, Cultural Event, Volunteering, Sick, Music, Art Show, Doctors, Pop Up, Bars, Project Work, Travel, Brunch, Self Care, Theater, Trivia, Meeting, Broadway, Bars, Clubbing, Baseball, Bachelor Party, House Warming, Visitors, Short Trip, Holiday Trip
 
-Examples:
-- "let's recap my workout today" → {"is_review": true, "date": null, "event_type": "Exercise", "name_query": null, "days_back": 1}
-- "review dinner with Sarah last night" → {"is_review": true, "date": null, "event_type": "Dinner", "name_query": "Sarah", "days_back": 2}
-- "hey what's the weather" → {"is_review": false, "date": null, "event_type": null, "name_query": null, "days_back": 1}
-- "recap my meeting on monday" → {"is_review": true, "date": null, "event_type": "Meeting", "name_query": null, "days_back": 7}
+"add_to_calendar" intent examples: "add dinner with Jake to my calendar", "put my workout on the cal", "add to my notion", "create a calendar event for lunch tomorrow", "schedule a meeting for friday"
+"review" intent examples: "let's recap my workout today", "review dinner with Sarah last night", "recap my meeting"
+"general" intent: everything else
 
 Today's date is: {today}
 
 Respond with ONLY the JSON object, no other text."""
+
+ADD_EVENT_PROMPT = """You are Rocky, helping the user add an event to their Notion calendar over iMessage.
+
+You need to collect these details:
+- Name (required): what is this event called?
+- Date (required): when is it?
+- Type of Event (required): pick the best match from the list
+- Location (optional)
+- Notes (optional)
+
+Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation, Lunch, Party, Coffee, FaceTime, Happy Hour, Sports, Wedding, Festival, Work, Food, Remote Work Trip, Haircut, Movie, Coffee Club, Podcast, Appointment, Art, Date, Comedy Show, Basketball, Therapy, Birthday, Drinks, Hangout, Grocery, Laundry, Beach, Airport, Errand, Breakfast, Cowork, Cultural Event, Volunteering, Sick, Music, Bars, Project Work, Travel, Brunch, Self Care, Theater, Trivia, Meeting, Broadway, Clubbing, Baseball, Bachelor Party, House Warming, Visitors, Short Trip, Holiday Trip
+
+Today's date is: {today}
+
+Current collected info: {collected}
+
+Rules:
+- Ask for missing required fields one round at a time
+- Keep it conversational and short
+- Infer what you can from context (e.g. "dinner tomorrow" → Type: Dinner, Date: tomorrow's date)
+- Once you have name, date, and type, confirm and create it
+
+When you have enough to create the event, respond with ONLY this JSON:
+{{"ready": true, "name": "...", "date": "YYYY-MM-DD", "event_type": "...", "location": "...", "notes": "...", "confirm_message": "Short confirmation message to send the user"}}
+
+If location or notes are not provided, use empty strings."""
 
 
 def send_message(chat_guid: str, text: str):
@@ -123,36 +145,44 @@ def webhook():
 def handle_message(chat_guid: str, sender: str, text: str):
     session = sessions.get(sender, {})
 
-    # If in an active review session, continue it
+    # Continue active sessions
     if session.get("state") == "reviewing":
         handle_review_response(chat_guid, sender, text, session)
         return
+    if session.get("state") == "selecting_event":
+        handle_review_response(chat_guid, sender, text, session)
+        return
+    if session.get("state") == "creating_event":
+        handle_create_event_response(chat_guid, sender, text, session)
+        return
 
-    # Check if this is a review/recap intent
-    intent = detect_review_intent(text)
+    # Detect intent
+    intent = detect_intent(text)
+    logger.info(f"Detected intent: {intent}")
 
-    if intent and intent.get("is_review"):
+    if intent and intent.get("intent") == "review":
         start_review_session(chat_guid, sender, text, intent)
+    elif intent and intent.get("intent") == "add_to_calendar":
+        start_create_event_session(chat_guid, sender, text)
     else:
         handle_general_message(chat_guid, sender, text)
 
 
-def detect_review_intent(text: str) -> dict | None:
-    """Use Claude to detect if the user wants to review a calendar event."""
+def detect_intent(text: str) -> dict | None:
     try:
         today = datetime.now().strftime("%Y-%m-%d")
         prompt = INTENT_PROMPT.replace("{today}", today)
         messages = [{"role": "user", "content": text}]
         response = get_claude_response(prompt, messages, model="claude-haiku-4-5")
-        parsed = json.loads(response.strip())
-        return parsed
+        return json.loads(response.strip())
     except Exception as e:
         logger.error(f"Error detecting intent: {e}")
         return None
 
 
+# ── REVIEW SESSION ──────────────────────────────────────────────
+
 def start_review_session(chat_guid: str, sender: str, text: str, intent: dict):
-    """Find matching events and start a review session."""
     events = search_events(
         query_date=intent.get("date"),
         event_type=intent.get("event_type"),
@@ -165,11 +195,8 @@ def start_review_session(chat_guid: str, sender: str, text: str, intent: dict):
         return
 
     if len(events) == 1:
-        # Only one match — start the review
-        event = events[0]
-        start_event_review(chat_guid, sender, event)
+        start_event_review(chat_guid, sender, events[0])
     else:
-        # Multiple matches — ask which one
         event_list = "\n".join([
             f"{i+1}. {e['name']} ({e['type']}) — {e['scheduled'][:10]}"
             for i, e in enumerate(events[:5])
@@ -183,7 +210,6 @@ def start_review_session(chat_guid: str, sender: str, text: str, intent: dict):
 
 
 def start_event_review(chat_guid: str, sender: str, event: dict):
-    """Kick off the review conversation for a specific event."""
     sessions[sender] = {
         "state": "reviewing",
         "event": event,
@@ -191,15 +217,10 @@ def start_event_review(chat_guid: str, sender: str, event: dict):
         "chat_guid": chat_guid
     }
 
-    event_desc = f"{event['name']}"
-    if event.get("type"):
-        event_desc += f" ({event['type']})"
-    if event.get("scheduled"):
-        event_desc += f" on {event['scheduled'][:10]}"
-    if event.get("location"):
-        event_desc += f" at {event['location']}"
-
     review_system = build_review_system_prompt(event)
+    event_desc = event['name']
+    if event.get('scheduled'):
+        event_desc += f" on {event['scheduled'][:10]}"
     opening_messages = [{"role": "user", "content": f"Let's review: {event_desc}"}]
     opening = get_claude_response(review_system, opening_messages, model="claude-sonnet-4-6")
 
@@ -208,9 +229,6 @@ def start_event_review(chat_guid: str, sender: str, event: dict):
 
 
 def handle_review_response(chat_guid: str, sender: str, text: str, session: dict):
-    """Handle a message during an active review session."""
-
-    # Handle event selection
     if session.get("state") == "selecting_event":
         try:
             idx = int(text.strip()) - 1
@@ -225,7 +243,6 @@ def handle_review_response(chat_guid: str, sender: str, text: str, session: dict
 
     event = session["event"]
     history = session["history"]
-
     history.append({"role": "user", "content": text})
 
     review_system = build_review_system_prompt(event)
@@ -233,7 +250,6 @@ def handle_review_response(chat_guid: str, sender: str, text: str, session: dict
     model = "claude-haiku-4-5" if word_count < 50 else "claude-sonnet-4-6"
     response_text = get_claude_response(review_system, history, model=model)
 
-    # Check if review is done (Claude returns JSON with done:true)
     try:
         start = response_text.find("{")
         end = response_text.rfind("}") + 1
@@ -241,16 +257,10 @@ def handle_review_response(chat_guid: str, sender: str, text: str, session: dict
             parsed = json.loads(response_text[start:end])
             if parsed.get("done"):
                 summary = parsed.get("summary", "")
-                closing = parsed.get("closing_message", "Got it, saved to Notion! ✅")
-
-                # Write notes back to Notion
+                closing = parsed.get("closing_message", "Saved to Notion! ✅")
                 success = write_event_notes(event["id"], summary)
-                if success:
-                    send_message(chat_guid, closing)
-                else:
-                    send_message(chat_guid, f"{closing}\n\n(Note: couldn't save to Notion — check the connection.)")
-
-                # Clear session
+                msg = closing if success else f"{closing}\n\n(Couldn't save to Notion — check the connection.)"
+                send_message(chat_guid, msg)
                 sessions.pop(sender, None)
                 return
     except (json.JSONDecodeError, ValueError):
@@ -274,21 +284,99 @@ Event details:
 - Date: {event.get('scheduled', 'Unknown')[:10] if event.get('scheduled') else 'Unknown'}
 - Location: {event.get('location', 'Not specified')}{notes_context}
 
-Your job is to have a short, natural conversation to capture what happened. Keep it casual and conversational — this is iMessage.
+Your job is to have a short, natural conversation to capture what happened. Keep it casual — this is iMessage.
 
 RULES:
 - Ask 2-3 focused questions max, all in one message
 - Keep messages short
 - After 1-2 rounds of answers, wrap up
 
-When you have enough info, respond with ONLY this JSON (no other text):
-{{"done": true, "summary": "A concise summary of what happened, 2-5 sentences.", "closing_message": "Short friendly closing message"}}
+When you have enough info, respond with ONLY this JSON:
+{{"done": true, "summary": "Concise summary, 2-5 sentences.", "closing_message": "Short friendly closing"}}
 
 Start by acknowledging the event and asking your first questions."""
 
 
+# ── CREATE EVENT SESSION ────────────────────────────────────────
+
+def start_create_event_session(chat_guid: str, sender: str, text: str):
+    sessions[sender] = {
+        "state": "creating_event",
+        "history": [],
+        "collected": {},
+        "chat_guid": chat_guid
+    }
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    prompt = ADD_EVENT_PROMPT.replace("{today}", today).replace("{collected}", "{}")
+    messages = [{"role": "user", "content": text}]
+    response = get_claude_response(prompt, messages, model="claude-sonnet-4-6")
+
+    # Check if Claude already has enough to create immediately
+    try:
+        start = response.find("{")
+        end = response.rfind("}") + 1
+        if start >= 0 and end > start:
+            parsed = json.loads(response[start:end])
+            if parsed.get("ready"):
+                finalize_event_creation(chat_guid, sender, parsed)
+                return
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    sessions[sender]["history"].append({"role": "assistant", "content": response})
+    send_message(chat_guid, response)
+
+
+def handle_create_event_response(chat_guid: str, sender: str, text: str, session: dict):
+    history = session["history"]
+    collected = session.get("collected", {})
+    history.append({"role": "user", "content": text})
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    prompt = ADD_EVENT_PROMPT.replace("{today}", today).replace("{collected}", json.dumps(collected))
+    word_count = len(text.split())
+    model = "claude-haiku-4-5" if word_count < 50 else "claude-sonnet-4-6"
+    response = get_claude_response(prompt, history, model=model)
+
+    # Check if ready to create
+    try:
+        start = response.find("{")
+        end = response.rfind("}") + 1
+        if start >= 0 and end > start:
+            parsed = json.loads(response[start:end])
+            if parsed.get("ready"):
+                finalize_event_creation(chat_guid, sender, parsed)
+                return
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    history.append({"role": "assistant", "content": response})
+    session["history"] = history
+    sessions[sender] = session
+    send_message(chat_guid, response)
+
+
+def finalize_event_creation(chat_guid: str, sender: str, event_data: dict):
+    success = create_calendar_event(
+        name=event_data.get("name", ""),
+        date=event_data.get("date", ""),
+        event_type=event_data.get("event_type", ""),
+        location=event_data.get("location", ""),
+        notes=event_data.get("notes", "")
+    )
+
+    if success:
+        send_message(chat_guid, event_data.get("confirm_message", f"Added \"{event_data.get('name')}\" to your calendar! ✅"))
+    else:
+        send_message(chat_guid, f"Couldn't add to Notion — check the connection. Details were: {event_data.get('name')} on {event_data.get('date')}")
+
+    sessions.pop(sender, None)
+
+
+# ── GENERAL ────────────────────────────────────────────────────
+
 def handle_general_message(chat_guid: str, sender: str, text: str):
-    """Handle general conversation."""
     word_count = len(text.split())
     model = "claude-haiku-4-5" if word_count < 50 else "claude-sonnet-4-6"
     logger.info(f"General message, routing to {model}")
