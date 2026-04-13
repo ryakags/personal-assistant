@@ -6,17 +6,19 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-NOTION_CALENDAR_DB = "collection://1f889657-f277-459b-a531-f039a9965f95"
+# The actual database ID for API calls — read from environment
+CALENDAR_DB_ID = os.environ.get("NOTION_CALENDAR_DB", "")
 
-HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Content-Type": "application/json",
-    "Notion-Version": "2022-06-28"
-}
 
-# The actual database ID (without collection:// prefix) for API calls
-CALENDAR_DB_ID = "1f889657-f277-459b-a531-f039a9965f95"
+def _headers():
+    token = os.environ.get("NOTION_TOKEN")
+    if not token:
+        raise ValueError("NOTION_TOKEN environment variable is not set")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
 
 
 def search_events(query_date: str = None, event_type: str = None, name_query: str = None, days_back: int = 1) -> list:
@@ -67,7 +69,7 @@ def search_events(query_date: str = None, event_type: str = None, name_query: st
     try:
         response = httpx.post(
             f"https://api.notion.com/v1/databases/{CALENDAR_DB_ID}/query",
-            headers=HEADERS,
+            headers=_headers(),
             json=body,
             timeout=10
         )
@@ -133,7 +135,7 @@ def write_event_notes(page_id: str, notes: str) -> bool:
     try:
         response = httpx.patch(
             f"https://api.notion.com/v1/pages/{page_id}",
-            headers=HEADERS,
+            headers=_headers(),
             json={
                 "properties": {
                     "Notes": {
@@ -202,7 +204,7 @@ def create_calendar_event(name: str, date: str, event_type: str, location: str =
     try:
         response = httpx.post(
             "https://api.notion.com/v1/pages",
-            headers=HEADERS,
+            headers=_headers(),
             json={
                 "parent": {"database_id": CALENDAR_DB_ID},
                 "properties": properties
