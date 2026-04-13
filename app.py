@@ -4,8 +4,7 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-from supabase_client import get_active_session, create_session, update_session, close_session
-from notion_client_wrapper import get_todays_events, update_event_notes, update_contact
+from notion_client_wrapper import search_events, write_event_notes
 from claude_client import get_claude_response
 
 logging.basicConfig(level=logging.INFO)
@@ -13,16 +12,41 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Your personal number — only respond to messages from this number
 MY_NUMBER = "+19168331436"
-
-# BlueBubbles server config
 BLUEBUBBLES_URL = os.environ.get("BLUEBUBBLES_URL", "http://localhost:1234")
 BLUEBUBBLES_PASSWORD = os.environ.get("BLUEBUBBLES_PASSWORD", "")
 
+# In-memory session store: { phone_number: session_dict }
+# session_dict keys: event, history, state ("reviewing" | None)
+sessions = {}
+
+SYSTEM_PROMPT = """You are Rocky, a personal AI assistant available over iMessage. You are helpful, concise, and conversational — this is iMessage, not email. Keep responses short and punchy. You can help with anything: questions, drafting, thinking through problems, recommendations, math, etc.
+
+You also have access to the user's Notion calendar. When the user wants to review or recap a past activity, you will be given details about the event and asked to conduct the review."""
+
+INTENT_PROMPT = """You are analyzing a message to determine if the user wants to review/recap a past calendar event.
+
+Return a JSON object with:
+- "is_review": true/false — whether they want to review an event
+- "date": ISO date string like "2026-04-13" or null if today/recent
+- "event_type": one of the Notion event types or null (e.g. "Exercise", "Dinner", "Lunch", "Coffee", "Meeting", "Workout")
+- "name_query": a partial name to search for, or null
+- "days_back": how many days back to search (default 1)
+
+Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation, Lunch, Party, Coffee, FaceTime, Happy Hour, Sports, Wedding, Festival, Work, Food, Remote Work Trip, Haircut, Movie, Coffee Club, Podcast, Appointment, Art, Date, Comedy Show, Basketball, Therapy, Notes & Food Planning, Birthday, Drinks, Hangout, Grocery, Laundry, Beach, Airport, Speaker Event, Open Mic, Errand, Breakfast, Cowork, Cultural Event, Volunteering, Sick, Music, Art Show, Doctors, Pop Up, Canceled, Bars, Project Work, Travel, Brunch, Self Care, Theater, Trivia, Meeting, Broadway
+
+Examples:
+- "let's recap my workout today" → {"is_review": true, "date": null, "event_type": "Exercise", "name_query": null, "days_back": 1}
+- "review dinner with Sarah last night" → {"is_review": true, "date": null, "event_type": "Dinner", "name_query": "Sarah", "days_back": 2}
+- "hey what's the weather" → {"is_review": false, "date": null, "event_type": null, "name_query": null, "days_back": 1}
+- "recap my meeting on monday" → {"is_review": true, "date": null, "event_type": "Meeting", "name_query": null, "days_back": 7}
+
+Today's date is: {today}
+
+Respond with ONLY the JSON object, no other text."""
+
 
 def send_message(chat_guid: str, text: str):
-    """Send an iMessage reply via BlueBubbles REST API."""
     url = f"{BLUEBUBBLES_URL}/api/v1/message/text"
     payload = {
         "chatGuid": chat_guid,
@@ -40,32 +64,23 @@ def send_message(chat_guid: str, text: str):
 
 
 def extract_sender_number(data: dict) -> str | None:
-    """Extract the sender's phone number from a BlueBubbles webhook payload."""
     try:
-        message = data.get("data", {})
-        handle = message.get("handle", {})
-        return handle.get("address", "")
+        return data.get("data", {}).get("handle", {}).get("address", "")
     except Exception:
         return None
 
 
 def extract_message_text(data: dict) -> str | None:
-    """Extract the message text from a BlueBubbles webhook payload."""
     try:
-        message = data.get("data", {})
-        return message.get("text", "").strip()
+        return data.get("data", {}).get("text", "").strip()
     except Exception:
         return None
 
 
 def extract_chat_guid(data: dict) -> str | None:
-    """Extract the chat GUID from a BlueBubbles webhook payload."""
     try:
-        message = data.get("data", {})
-        chats = message.get("chats", [])
-        if chats:
-            return chats[0].get("guid", "")
-        return None
+        chats = data.get("data", {}).get("chats", [])
+        return chats[0].get("guid", "") if chats else None
     except Exception:
         return None
 
@@ -75,23 +90,17 @@ def webhook():
     data = request.json
     logger.info(f"Incoming webhook: {json.dumps(data)}")
 
-    # Only handle new incoming messages
-    event_type = data.get("type", "")
-    if event_type != "new-message":
+    if data.get("type") != "new-message":
         return jsonify({"ok": True})
 
     message = data.get("data", {})
-
-    # Ignore outgoing messages (ones Rocky sent)
     if message.get("isFromMe", False):
         return jsonify({"ok": True})
 
-    # Ignore reactions, read receipts, attachments-only messages
     text = extract_message_text(data)
     if not text:
         return jsonify({"ok": True})
 
-    # Only respond to messages from your personal number
     sender = extract_sender_number(data)
     if not sender or sender != MY_NUMBER:
         logger.info(f"Ignoring message from unknown sender: {sender}")
@@ -99,75 +108,132 @@ def webhook():
 
     chat_guid = extract_chat_guid(data)
     if not chat_guid:
-        logger.error("Could not extract chat GUID from payload")
+        logger.error("Could not extract chat GUID")
         return jsonify({"ok": True})
 
     try:
         handle_message(chat_guid, sender, text)
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
-        send_message(chat_guid, "Sorry, something went wrong. Please try again.")
+        send_message(chat_guid, "Sorry, something went wrong. Try again?")
 
     return jsonify({"ok": True})
 
 
 def handle_message(chat_guid: str, sender: str, text: str):
-    # Use sender number as the session key (replaces Telegram chat_id)
-    session = get_active_session(sender)
+    session = sessions.get(sender, {})
 
-    if not session:
-        send_message(chat_guid, "No active recap session. I'll message you tonight at 10pm!")
+    # If in an active review session, continue it
+    if session.get("state") == "reviewing":
+        handle_review_response(chat_guid, sender, text, session)
         return
 
-    events = session["events"]
-    current_index = session["current_event_index"]
-    history = session["conversation_history"] or []
+    # Check if this is a review/recap intent
+    intent = detect_review_intent(text)
 
-    if current_index >= len(events):
-        send_message(chat_guid, "You've recapped all your events for today. Great job! 🎉")
-        close_session(session["id"])
+    if intent and intent.get("is_review"):
+        start_review_session(chat_guid, sender, text, intent)
+    else:
+        handle_general_message(chat_guid, sender, text)
+
+
+def detect_review_intent(text: str) -> dict | None:
+    """Use Claude to detect if the user wants to review a calendar event."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        prompt = INTENT_PROMPT.replace("{today}", today)
+        messages = [{"role": "user", "content": text}]
+        response = get_claude_response(prompt, messages, model="claude-haiku-4-5")
+        parsed = json.loads(response.strip())
+        return parsed
+    except Exception as e:
+        logger.error(f"Error detecting intent: {e}")
+        return None
+
+
+def start_review_session(chat_guid: str, sender: str, text: str, intent: dict):
+    """Find matching events and start a review session."""
+    events = search_events(
+        query_date=intent.get("date"),
+        event_type=intent.get("event_type"),
+        name_query=intent.get("name_query"),
+        days_back=intent.get("days_back", 1)
+    )
+
+    if not events:
+        send_message(chat_guid, "I couldn't find any matching events in your calendar. Can you be more specific?")
         return
 
-    current_event = events[current_index]
+    if len(events) == 1:
+        # Only one match — start the review
+        event = events[0]
+        start_event_review(chat_guid, sender, event)
+    else:
+        # Multiple matches — ask which one
+        event_list = "\n".join([
+            f"{i+1}. {e['name']} ({e['type']}) — {e['scheduled'][:10]}"
+            for i, e in enumerate(events[:5])
+        ])
+        sessions[sender] = {
+            "state": "selecting_event",
+            "events": events[:5],
+            "chat_guid": chat_guid
+        }
+        send_message(chat_guid, f"Found a few events. Which one?\n\n{event_list}")
+
+
+def start_event_review(chat_guid: str, sender: str, event: dict):
+    """Kick off the review conversation for a specific event."""
+    sessions[sender] = {
+        "state": "reviewing",
+        "event": event,
+        "history": [],
+        "chat_guid": chat_guid
+    }
+
+    event_desc = f"{event['name']}"
+    if event.get("type"):
+        event_desc += f" ({event['type']})"
+    if event.get("scheduled"):
+        event_desc += f" on {event['scheduled'][:10]}"
+    if event.get("location"):
+        event_desc += f" at {event['location']}"
+
+    review_system = build_review_system_prompt(event)
+    opening_messages = [{"role": "user", "content": f"Let's review: {event_desc}"}]
+    opening = get_claude_response(review_system, opening_messages, model="claude-sonnet-4-6")
+
+    sessions[sender]["history"].append({"role": "assistant", "content": opening})
+    send_message(chat_guid, opening)
+
+
+def handle_review_response(chat_guid: str, sender: str, text: str, session: dict):
+    """Handle a message during an active review session."""
+
+    # Handle event selection
+    if session.get("state") == "selecting_event":
+        try:
+            idx = int(text.strip()) - 1
+            events = session.get("events", [])
+            if 0 <= idx < len(events):
+                start_event_review(chat_guid, sender, events[idx])
+            else:
+                send_message(chat_guid, "Please reply with a number from the list.")
+        except ValueError:
+            send_message(chat_guid, "Please reply with the number of the event you want to review.")
+        return
+
+    event = session["event"]
+    history = session["history"]
+
     history.append({"role": "user", "content": text})
 
-    system_prompt = f"""You are a warm, conversational personal assistant helping the user recap their day over iMessage.
-
-You are currently discussing this calendar event:
-- Title: {current_event.get('title', 'Unknown event')}
-- Type: {current_event.get('type', 'Unknown')}
-- People involved: {', '.join(current_event.get('people', [])) if current_event.get('people') else 'No one listed'}
-
-Your job is to ask follow-up questions to get a good summary of what happened. Follow these rules strictly:
-
-QUESTIONING RULES:
-- Ask a MAXIMUM of 2-3 follow-up questions total across the whole conversation
-- Always number your questions like: "1. How did it go?\n2. Any follow-ups needed?"
-- Ask all your questions in one message — never one question at a time
-- Keep messages short and conversational — this is iMessage, not email
-
-WHEN TO WRAP UP:
-- After the user has answered 1-2 rounds of questions, you have enough info — wrap up
-- Do NOT keep asking more questions after that
-
-SUMMARY FORMAT:
-- Write the summary as 2-5 bullet points (use • character)
-- Each bullet should be one clear, specific fact or takeaway
-- Include any follow-up actions as the last bullet(s) if applicable
-
-When you have enough info, respond with ONLY this exact JSON (no other text):
-{{"done": true, "summary": "• Bullet one\n• Bullet two\n• Bullet three", "followups": ["follow-up action if any"], "next_message": "Short friendly transition message"}}
-
-The summary field must use bullet points with the • character and \\n between each bullet."""
-
-    # Model routing: Haiku for short messages, Sonnet for longer/complex ones
+    review_system = build_review_system_prompt(event)
     word_count = len(text.split())
     model = "claude-haiku-4-5" if word_count < 50 else "claude-sonnet-4-6"
-    logger.info(f"Routing to {model} (word count: {word_count})")
+    response_text = get_claude_response(review_system, history, model=model)
 
-    response_text = get_claude_response(system_prompt, history, model=model)
-
-    # Try to parse as done JSON
+    # Check if review is done (Claude returns JSON with done:true)
     try:
         start = response_text.find("{")
         end = response_text.rfind("}") + 1
@@ -175,76 +241,60 @@ The summary field must use bullet points with the • character and \\n between 
             parsed = json.loads(response_text[start:end])
             if parsed.get("done"):
                 summary = parsed.get("summary", "")
-                followups = parsed.get("followups", [])
-                next_message = parsed.get("next_message", "Moving on!")
+                closing = parsed.get("closing_message", "Got it, saved to Notion! ✅")
 
-                update_event_notes(page_id=current_event["id"], summary=summary, followups=followups)
-
-                for contact in current_event.get("contacts", []):
-                    update_contact(
-                        page_id=contact["id"],
-                        name=contact.get("name", ""),
-                        summary=summary,
-                        followups=followups,
-                        event_title=current_event.get("title", "")
-                    )
-
-                new_index = current_index + 1
-                update_session(session["id"], {
-                    "current_event_index": new_index,
-                    "conversation_history": []
-                })
-
-                send_message(chat_guid, next_message)
-
-                if new_index < len(events):
-                    next_event = events[new_index]
-                    send_message(chat_guid, f"Next up: {next_event['title']}. What happened?")
+                # Write notes back to Notion
+                success = write_event_notes(event["id"], summary)
+                if success:
+                    send_message(chat_guid, closing)
                 else:
-                    send_message(chat_guid, "That's all your events for today. Great recap! 🎉")
-                    close_session(session["id"])
-                return
+                    send_message(chat_guid, f"{closing}\n\n(Note: couldn't save to Notion — check the connection.)")
 
+                # Clear session
+                sessions.pop(sender, None)
+                return
     except (json.JSONDecodeError, ValueError):
         pass
 
     history.append({"role": "assistant", "content": response_text})
-    update_session(session["id"], {"conversation_history": history})
+    session["history"] = history
+    sessions[sender] = session
     send_message(chat_guid, response_text)
 
 
-def nightly_recap():
-    """Triggered externally via cron-job.org hitting /trigger-recap."""
-    logger.info("Running nightly recap trigger...")
+def build_review_system_prompt(event: dict) -> str:
+    existing_notes = event.get("notes", "")
+    notes_context = f"\nExisting notes: {existing_notes}" if existing_notes else ""
 
-    try:
-        events = get_todays_events()
-        if not events:
-            logger.info("No events today, skipping recap.")
-            return
+    return f"""You are Rocky, a personal AI assistant conducting a review of a calendar event over iMessage.
 
-        create_session(MY_NUMBER, events)
+Event details:
+- Name: {event.get('name', 'Unknown')}
+- Type: {event.get('type', 'Unknown')}
+- Date: {event.get('scheduled', 'Unknown')[:10] if event.get('scheduled') else 'Unknown'}
+- Location: {event.get('location', 'Not specified')}{notes_context}
 
-        event_titles = [e["title"] for e in events]
-        if len(event_titles) == 1:
-            intro = f"Hey! You had {event_titles[0]} today."
-        else:
-            listed = ", ".join(event_titles[:-1]) + f" and {event_titles[-1]}"
-            intro = f"Hey! You had {listed} today."
+Your job is to have a short, natural conversation to capture what happened. Keep it casual and conversational — this is iMessage.
 
-        # Get the chat GUID for your number to send the opening message
-        # BlueBubbles uses iMessage:+1XXXXXXXXXX format for 1:1 chats
-        chat_guid = f"iMessage;-;{MY_NUMBER}"
-        send_message(chat_guid, f"{intro}\n\nLet's do a quick recap. What happened during {event_titles[0]}?")
+RULES:
+- Ask 2-3 focused questions max, all in one message
+- Keep messages short
+- After 1-2 rounds of answers, wrap up
 
-    except Exception as e:
-        logger.error(f"Error in nightly recap: {e}", exc_info=True)
+When you have enough info, respond with ONLY this JSON (no other text):
+{{"done": true, "summary": "A concise summary of what happened, 2-5 sentences.", "closing_message": "Short friendly closing message"}}
+
+Start by acknowledging the event and asking your first questions."""
 
 
-@app.route("/trigger-recap", methods=["GET", "POST"])
-def trigger_recap():
-    nightly_recap()
-    return jsonify({"ok": True, "message": "Recap triggered"})
+def handle_general_message(chat_guid: str, sender: str, text: str):
+    """Handle general conversation."""
+    word_count = len(text.split())
+    model = "claude-haiku-4-5" if word_count < 50 else "claude-sonnet-4-6"
+    logger.info(f"General message, routing to {model}")
+    messages = [{"role": "user", "content": text}]
+    response = get_claude_response(SYSTEM_PROMPT, messages, model=model)
+    send_message(chat_guid, response)
 
 
 @app.route("/health", methods=["GET"])
