@@ -173,3 +173,45 @@ def update_event_notes(page_id: str, summary: str, followups: list = None) -> bo
 def update_contact(page_id: str, name: str, summary: str, followups: list, event_title: str):
     """Legacy function - kept for backwards compatibility."""
     pass
+
+
+def create_calendar_event(name: str, date: str, event_type: str, location: str = "", notes: str = "") -> bool:
+    """Create a new event in the Notion calendar database."""
+    properties = {
+        "Name": {
+            "title": [{"type": "text", "text": {"content": name}}]
+        },
+        "Scheduled": {
+            "date": {"start": date}
+        }
+    }
+
+    if event_type:
+        properties["Type of Event"] = {"select": {"name": event_type}}
+
+    if location:
+        properties["Location"] = {
+            "rich_text": [{"type": "text", "text": {"content": location}}]
+        }
+
+    if notes:
+        properties["Notes"] = {
+            "rich_text": [{"type": "text", "text": {"content": notes}}]
+        }
+
+    try:
+        response = httpx.post(
+            "https://api.notion.com/v1/pages",
+            headers=HEADERS,
+            json={
+                "parent": {"database_id": CALENDAR_DB_ID},
+                "properties": properties
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        logger.info(f"Created calendar event: {name} on {date}")
+        return True
+    except Exception as e:
+        logger.error(f"Error creating Notion event: {e}", exc_info=True)
+        return False
