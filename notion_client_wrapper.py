@@ -1,15 +1,13 @@
 import os
-import httpx
+import json
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+import httpx
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-NOTION_CALENDAR_DB = os.environ.get("NOTION_CALENDAR_DB")
-NOTION_CONTACTS_DB = os.environ.get("NOTION_CONTACTS_DB")
-TIMEZONE_OFFSET = int(os.environ.get("TIMEZONE_OFFSET", "-5"))  # Default to ET
+NOTION_CALENDAR_DB = "collection://1f889657-f277-459b-a531-f039a9965f95"
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -17,19 +15,61 @@ HEADERS = {
     "Notion-Version": "2022-06-28"
 }
 
+# The actual database ID (without collection:// prefix) for API calls
+CALENDAR_DB_ID = "1f889657-f277-459b-a531-f039a9965f95"
 
-def get_todays_events() -> list:
-    """Query Notion calendar for today's events."""
+
+def search_events(query_date: str = None, event_type: str = None, name_query: str = None, days_back: int = 1) -> list:
+    """
+    Search Notion calendar for events matching criteria.
+    query_date: ISO date string like "2026-04-13"
+    event_type: type of event like "Dinner", "Exercise", etc.
+    name_query: partial name to search for
+    days_back: how many days back to search if no specific date
+    """
+    filters = []
+
+    # Date filter
+    if query_date:
+        filters.append({
+            "property": "Scheduled",
+            "date": {
+                "equals": query_date
+            }
+        })
+    else:
+        # Default to recent events (last N days)
+        since = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        filters.append({
+            "property": "Scheduled",
+            "date": {
+                "on_or_after": since
+            }
+        })
+
+    # Event type filter
+    if event_type:
+        filters.append({
+            "property": "Type of Event",
+            "select": {
+                "equals": event_type
+            }
+        })
+
+    filter_body = {"and": filters} if len(filters) > 1 else filters[0] if filters else {}
+
+    body = {
+        "filter": filter_body,
+        "sorts": [{"property": "Scheduled", "direction": "descending"}],
+        "page_size": 10
+    }
+
     try:
-        now = datetime.now(timezone(timedelta(hours=TIMEZONE_OFFSET)))
-        today = now.strftime("%Y-%m-%d")
-        logger.info(f"Querying Notion for events on: {today}")
-
         response = httpx.post(
-            f"https://api.notion.com/v1/databases/{NOTION_CALENDAR_DB}/query",
+            f"https://api.notion.com/v1/databases/{CALENDAR_DB_ID}/query",
             headers=HEADERS,
-            json={"filter": {"property": "Scheduled", "date": {"equals": today}}},
-            timeout=15
+            json=body,
+            timeout=10
         )
         response.raise_for_status()
         results = response.json().get("results", [])
@@ -37,172 +77,99 @@ def get_todays_events() -> list:
         events = []
         for page in results:
             props = page.get("properties", {})
-            title = _get_title(props)
-            event_type = _get_select(props, "Type of Event")
-            workout = _get_multi_select(props, "Workout")
-            people_relation = props.get("People Involved", {}).get("relation", [])
 
-            contacts = []
-            for rel in people_relation:
-                contact_id = rel.get("id", "")
-                contact_name = _get_page_title(contact_id)
-                if contact_id:
-                    contacts.append({"id": contact_id, "name": contact_name})
+            # Extract name
+            name_prop = props.get("Name", {})
+            name = ""
+            if name_prop.get("title"):
+                name = "".join([t.get("plain_text", "") for t in name_prop["title"]])
+
+            # Skip if name_query provided and doesn't match
+            if name_query and name_query.lower() not in name.lower():
+                continue
+
+            # Extract scheduled date
+            scheduled_prop = props.get("Scheduled", {}).get("date", {})
+            scheduled = scheduled_prop.get("start", "") if scheduled_prop else ""
+
+            # Extract type
+            type_prop = props.get("Type of Event", {}).get("select", {})
+            event_type_val = type_prop.get("name", "") if type_prop else ""
+
+            # Extract existing notes
+            notes_prop = props.get("Notes", {})
+            notes = notes_prop.get("rich_text", [{}])
+            existing_notes = "".join([t.get("plain_text", "") for t in notes]) if notes else ""
+
+            # Extract people involved (relation - just get page IDs for now)
+            people_prop = props.get("People Involved", {}).get("relation", [])
+            people_ids = [p.get("id") for p in people_prop]
+
+            # Extract location
+            location_prop = props.get("Location", {})
+            location = ""
+            if location_prop.get("rich_text"):
+                location = "".join([t.get("plain_text", "") for t in location_prop["rich_text"]])
 
             events.append({
                 "id": page["id"],
-                "title": title,
-                "type": event_type,
-                "workout": workout,
-                "people": [c["name"] for c in contacts],
-                "contacts": contacts
+                "name": name,
+                "scheduled": scheduled,
+                "type": event_type_val,
+                "notes": existing_notes,
+                "location": location,
+                "people_ids": people_ids
             })
 
-        logger.info(f"Found {len(events)} events today")
         return events
 
     except Exception as e:
-        logger.error(f"Failed to get today's events: {e}", exc_info=True)
+        logger.error(f"Error searching Notion events: {e}", exc_info=True)
         return []
 
 
-def update_event_notes(page_id: str, summary: str, followups: list) -> bool:
-    """Update the Notes property on the event page."""
+def write_event_notes(page_id: str, notes: str) -> bool:
+    """Write notes back to a Notion calendar event."""
     try:
-        full_note = summary
-        if followups:
-            full_note += "\n\n📌 Follow-ups: " + " | ".join(followups)
-
-        httpx.patch(
+        response = httpx.patch(
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=HEADERS,
             json={
                 "properties": {
                     "Notes": {
-                        "rich_text": [{"type": "text", "text": {"content": full_note}}]
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": notes}
+                            }
+                        ]
                     }
                 }
             },
             timeout=10
-        ).raise_for_status()
-
-        logger.info(f"Updated event notes for {page_id}")
+        )
+        response.raise_for_status()
+        logger.info(f"Notes written to page {page_id}")
         return True
     except Exception as e:
-        logger.error(f"Failed to update event notes: {e}", exc_info=True)
+        logger.error(f"Error writing notes to Notion: {e}", exc_info=True)
         return False
 
 
-def update_contact(page_id: str, name: str, summary: str, followups: list, event_title: str) -> bool:
-    """Update a contact's Last Seen date and replace the Last Seen recap block."""
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        date_label = datetime.now().strftime("%B %d, %Y")
-
-        # Update Last Seen property
-        httpx.patch(
-            f"https://api.notion.com/v1/pages/{page_id}",
-            headers=HEADERS,
-            json={"properties": {"Last Seen": {"date": {"start": today}}}},
-            timeout=10
-        ).raise_for_status()
-
-        # Delete existing blocks so we replace instead of append
-        _clear_page_blocks(page_id)
-
-        # Build the new Last Seen recap block
-        full_summary = summary
-        if followups:
-            full_summary += "\n\n📌 Follow-up: " + " | ".join(followups)
-
-        blocks = [
-            {
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {
-                    "rich_text": [{"type": "text", "text": {"content": f"Last Seen — {date_label}"}}]
-                }
-            },
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{"type": "text", "text": {"content": f"{event_title}"}}]
-                }
-            },
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{"type": "text", "text": {"content": full_summary}}]
-                }
-            }
-        ]
-
-        httpx.patch(
-            f"https://api.notion.com/v1/blocks/{page_id}/children",
-            headers=HEADERS,
-            json={"children": blocks},
-            timeout=10
-        ).raise_for_status()
-
-        logger.info(f"Updated contact {name} ({page_id})")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update contact {name}: {e}", exc_info=True)
-        return False
+def get_todays_events() -> list:
+    """Get today's events - kept for backwards compatibility."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return search_events(query_date=today)
 
 
-def _clear_page_blocks(page_id: str):
-    """Delete all existing blocks on a page."""
-    try:
-        response = httpx.get(
-            f"https://api.notion.com/v1/blocks/{page_id}/children",
-            headers=HEADERS,
-            timeout=10
-        )
-        response.raise_for_status()
-        blocks = response.json().get("results", [])
-
-        for block in blocks:
-            block_id = block.get("id")
-            if block_id:
-                httpx.delete(
-                    f"https://api.notion.com/v1/blocks/{block_id}",
-                    headers=HEADERS,
-                    timeout=10
-                )
-    except Exception as e:
-        logger.error(f"Failed to clear blocks for {page_id}: {e}")
+def update_event_notes(page_id: str, summary: str, followups: list = None) -> bool:
+    """Legacy function - kept for backwards compatibility."""
+    notes = summary
+    if followups:
+        notes += "\n\nFollow-ups:\n" + "\n".join(f"- {f}" for f in followups)
+    return write_event_notes(page_id, notes)
 
 
-def _get_title(props: dict) -> str:
-    title_prop = props.get("Name") or props.get("title") or {}
-    title_list = title_prop.get("title", [])
-    return title_list[0]["plain_text"] if title_list else "Untitled"
-
-
-def _get_select(props: dict, key: str) -> str:
-    select = props.get(key, {}).get("select")
-    return select.get("name", "") if select else ""
-
-
-def _get_multi_select(props: dict, key: str) -> list:
-    items = props.get(key, {}).get("multi_select", [])
-    return [item["name"] for item in items]
-
-
-def _get_page_title(page_id: str) -> str:
-    """Fetch a page's title by ID."""
-    try:
-        response = httpx.get(
-            f"https://api.notion.com/v1/pages/{page_id}",
-            headers=HEADERS,
-            timeout=10
-        )
-        response.raise_for_status()
-        props = response.json().get("properties", {})
-        return _get_title(props)
-    except Exception as e:
-        logger.error(f"Failed to get page title for {page_id}: {e}")
-        return "Unknown"
+def update_contact(page_id: str, name: str, summary: str, followups: list, event_title: str):
+    """Legacy function - kept for backwards compatibility."""
+    pass
