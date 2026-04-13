@@ -174,7 +174,11 @@ def detect_intent(text: str) -> dict | None:
         prompt = INTENT_PROMPT.replace("{today}", today)
         messages = [{"role": "user", "content": text}]
         response = get_claude_response(prompt, messages, model="claude-haiku-4-5")
-        return json.loads(response.strip())
+        start = response.find("{")
+        end = response.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(response[start:end])
+        return None
     except Exception as e:
         logger.error(f"Error detecting intent: {e}")
         return None
