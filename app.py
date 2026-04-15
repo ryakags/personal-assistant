@@ -4,7 +4,7 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-from notion_client_wrapper import search_events, write_event_notes, create_calendar_event
+from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks
 from claude_client import get_claude_response
 
 logging.basicConfig(level=logging.INFO)
@@ -25,16 +25,17 @@ You also have access to the user's Notion calendar. When the user wants to revie
 INTENT_PROMPT = """You are analyzing a message to determine the user's intent.
 
 Return a JSON object with:
-- "intent": one of "review", "add_to_calendar", or "general"
+- "intent": one of "review", "add_to_calendar", "edit_page", or "general"
 - "date": ISO date string like "2026-04-13" or null
 - "event_type": Notion event type or null (e.g. "Exercise", "Dinner", "Lunch", "Coffee", "Meeting")
 - "name_query": partial name to search for, or null
-- "days_back": how many days back to search (default 1, for review intent only)
+- "days_back": how many days back to search (default 1, for review/edit_page intent only)
 
 Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation, Lunch, Party, Coffee, FaceTime, Happy Hour, Sports, Wedding, Festival, Work, Food, Remote Work Trip, Haircut, Movie, Coffee Club, Podcast, Appointment, Art, Date, Comedy Show, Basketball, Therapy, Birthday, Drinks, Hangout, Grocery, Laundry, Beach, Airport, Speaker Event, Open Mic, Errand, Breakfast, Cowork, Cultural Event, Volunteering, Sick, Music, Art Show, Doctors, Pop Up, Bars, Project Work, Travel, Brunch, Self Care, Theater, Trivia, Meeting, Broadway, Bars, Clubbing, Baseball, Bachelor Party, House Warming, Visitors, Short Trip, Holiday Trip
 
 "add_to_calendar" intent examples: "add dinner with Jake to my calendar", "put my workout on the cal", "add to my notion", "create a calendar event for lunch tomorrow", "schedule a meeting for friday"
 "review" intent examples: "let's recap my workout today", "review dinner with Sarah last night", "recap my meeting"
+"edit_page" intent examples: "update my workout today", "add notes to my dinner last night", "edit my meeting from this morning", "I want to add something to today's workout page"
 "general" intent: everything else
 
 Today's date is: {today}
@@ -66,6 +67,18 @@ When you have enough to create the event, respond with ONLY this JSON:
 {{"ready": true, "name": "...", "date": "YYYY-MM-DD", "event_type": "...", "location": "...", "notes": "...", "confirm_message": "Short confirmation message to send the user"}}
 
 If location or notes are not provided, use empty strings."""
+
+
+EDIT_PAGE_PROMPT = """You are Rocky, helping the user add notes to an existing Notion page over iMessage.
+
+Event: {event_name} ({event_type}) on {event_date}
+
+Your job is to collect what the user wants to add to the page body. Keep it short and conversational.
+
+- If the user has already provided content in their message, use it directly.
+- If not, ask once: "What do you want to add to this page?"
+- Once you have content, respond with ONLY this JSON:
+{{"ready": true, "content": "The notes to append verbatim", "closing_message": "Short friendly confirmation"}}"""
 
 
 def send_message(chat_guid: str, text: str):
@@ -155,6 +168,12 @@ def handle_message(chat_guid: str, sender: str, text: str):
     if session.get("state") == "creating_event":
         handle_create_event_response(chat_guid, sender, text, session)
         return
+    if session.get("state") == "editing_page":
+        handle_edit_page_response(chat_guid, sender, text, session)
+        return
+    if session.get("state") == "selecting_event_for_edit":
+        handle_edit_page_response(chat_guid, sender, text, session)
+        return
 
     # Detect intent
     intent = detect_intent(text)
@@ -164,6 +183,8 @@ def handle_message(chat_guid: str, sender: str, text: str):
         start_review_session(chat_guid, sender, text, intent)
     elif intent and intent.get("intent") == "add_to_calendar":
         start_create_event_session(chat_guid, sender, text)
+    elif intent and intent.get("intent") == "edit_page":
+        start_edit_page_session(chat_guid, sender, text, intent)
     else:
         handle_general_message(chat_guid, sender, text)
 
@@ -375,6 +396,118 @@ def finalize_event_creation(chat_guid: str, sender: str, event_data: dict):
     else:
         send_message(chat_guid, f"Couldn't add to Notion — check the connection. Details were: {event_data.get('name')} on {event_data.get('date')}")
 
+    sessions.pop(sender, None)
+
+
+# ── EDIT PAGE SESSION ──────────────────────────────────────────
+
+def start_edit_page_session(chat_guid: str, sender: str, text: str, intent: dict):
+    events = search_events(
+        query_date=intent.get("date"),
+        event_type=intent.get("event_type"),
+        name_query=intent.get("name_query"),
+        days_back=intent.get("days_back", 1)
+    )
+
+    if not events:
+        send_message(chat_guid, "I couldn't find any matching events. Can you be more specific?")
+        return
+
+    if len(events) == 1:
+        start_page_edit(chat_guid, sender, events[0], text)
+    else:
+        event_list = "\n".join([
+            f"{i+1}. {e['name']} ({e['type']}) — {e['scheduled'][:10]}"
+            for i, e in enumerate(events[:5])
+        ])
+        sessions[sender] = {
+            "state": "selecting_event_for_edit",
+            "events": events[:5],
+            "original_text": text,
+            "chat_guid": chat_guid
+        }
+        send_message(chat_guid, f"Found a few events. Which one?\n\n{event_list}")
+
+
+def start_page_edit(chat_guid: str, sender: str, event: dict, original_text: str):
+    sessions[sender] = {
+        "state": "editing_page",
+        "event": event,
+        "history": [],
+        "chat_guid": chat_guid
+    }
+
+    prompt = EDIT_PAGE_PROMPT.format(
+        event_name=event.get("name", "Unknown"),
+        event_type=event.get("type", "Unknown"),
+        event_date=event.get("scheduled", "")[:10] if event.get("scheduled") else "Unknown"
+    )
+    messages = [{"role": "user", "content": original_text}]
+    response = get_claude_response(prompt, messages, model="claude-haiku-4-5")
+
+    # Check if content was already provided in the original message
+    try:
+        start = response.find("{")
+        end = response.rfind("}") + 1
+        if start >= 0 and end > start:
+            parsed = json.loads(response[start:end])
+            if parsed.get("ready"):
+                finalize_page_edit(chat_guid, sender, event, parsed)
+                return
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    sessions[sender]["history"].append({"role": "assistant", "content": response})
+    send_message(chat_guid, response)
+
+
+def handle_edit_page_response(chat_guid: str, sender: str, text: str, session: dict):
+    if session.get("state") == "selecting_event_for_edit":
+        try:
+            idx = int(text.strip()) - 1
+            events = session.get("events", [])
+            if 0 <= idx < len(events):
+                start_page_edit(chat_guid, sender, events[idx], session.get("original_text", text))
+            else:
+                send_message(chat_guid, "Please reply with a number from the list.")
+        except ValueError:
+            send_message(chat_guid, "Please reply with the number of the event you want to edit.")
+        return
+
+    event = session["event"]
+    history = session["history"]
+    history.append({"role": "user", "content": text})
+
+    prompt = EDIT_PAGE_PROMPT.format(
+        event_name=event.get("name", "Unknown"),
+        event_type=event.get("type", "Unknown"),
+        event_date=event.get("scheduled", "")[:10] if event.get("scheduled") else "Unknown"
+    )
+    response = get_claude_response(prompt, history, model="claude-haiku-4-5")
+
+    try:
+        start = response.find("{")
+        end = response.rfind("}") + 1
+        if start >= 0 and end > start:
+            parsed = json.loads(response[start:end])
+            if parsed.get("ready"):
+                finalize_page_edit(chat_guid, sender, event, parsed)
+                return
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    history.append({"role": "assistant", "content": response})
+    session["history"] = history
+    sessions[sender] = session
+    send_message(chat_guid, response)
+
+
+def finalize_page_edit(chat_guid: str, sender: str, event: dict, parsed: dict):
+    content = parsed.get("content", "")
+    success = append_page_blocks(event["id"], content)
+    closing = parsed.get("closing_message", "Added to your Notion page!")
+    msg = closing if success else f"{closing}\n\n(Couldn't save to Notion — check the connection.)"
+    send_message(chat_guid, msg)
     sessions.pop(sender, None)
 
 

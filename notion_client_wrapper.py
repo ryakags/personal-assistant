@@ -158,6 +158,31 @@ def write_event_notes(page_id: str, notes: str) -> bool:
         return False
 
 
+def append_page_blocks(page_id: str, content: str) -> bool:
+    """Append a paragraph block to the body of a Notion page."""
+    try:
+        response = httpx.patch(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=_headers(),
+            json={
+                "children": [{
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [{"type": "text", "text": {"content": content}}]
+                    }
+                }]
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        logger.info(f"Appended block to page {page_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error appending block to Notion page: {e}", exc_info=True)
+        return False
+
+
 def get_todays_events() -> list:
     """Get today's events - kept for backwards compatibility."""
     today = datetime.now().strftime("%Y-%m-%d")
