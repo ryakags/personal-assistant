@@ -6,8 +6,9 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-# The actual database ID for API calls — read from environment
+# Database IDs — read from environment
 CALENDAR_DB_ID = os.environ.get("NOTION_CALENDAR_DB", "")
+CONTACTS_DB_ID = os.environ.get("NOTION_CONTACTS_DB", "")
 
 
 def _headers():
@@ -180,6 +181,73 @@ def append_page_blocks(page_id: str, content: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Error appending block to Notion page: {e}", exc_info=True)
+        return False
+
+
+def search_contacts(name_query: str) -> list:
+    """Search contacts database by name, sorted by most recent interaction."""
+    try:
+        response = httpx.post(
+            f"https://api.notion.com/v1/databases/{CONTACTS_DB_ID}/query",
+            headers=_headers(),
+            json={
+                "filter": {
+                    "property": "Name",
+                    "title": {"contains": name_query}
+                },
+                "page_size": 10
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        results = response.json().get("results", [])
+
+        contacts = []
+        for page in results:
+            props = page.get("properties", {})
+
+            name_prop = props.get("Name", {})
+            name = "".join([t.get("plain_text", "") for t in name_prop.get("title", [])])
+
+            # Extract Last Saw rollup date (rollup of relation to calendar events)
+            last_saw_prop = props.get("Last Saw", {})
+            last_saw = None
+            if last_saw_prop.get("type") == "rollup":
+                rollup = last_saw_prop.get("rollup", {})
+                if rollup.get("type") == "date" and rollup.get("date"):
+                    last_saw = rollup["date"].get("start")
+
+            contacts.append({"id": page["id"], "name": name, "last_saw": last_saw})
+
+        # Sort by last_saw descending (None goes to end)
+        contacts.sort(key=lambda c: c["last_saw"] or "", reverse=True)
+        return contacts
+
+    except Exception as e:
+        logger.error(f"Error searching contacts: {e}", exc_info=True)
+        return []
+
+
+def update_people_involved(event_page_id: str, contact_ids: list) -> bool:
+    """Update the People Involved relation on a calendar event."""
+    try:
+        response = httpx.patch(
+            f"https://api.notion.com/v1/pages/{event_page_id}",
+            headers=_headers(),
+            json={
+                "properties": {
+                    "People Involved": {
+                        "relation": [{"id": cid} for cid in contact_ids]
+                    }
+                }
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        logger.info(f"Updated People Involved on page {event_page_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error updating People Involved: {e}", exc_info=True)
         return False
 
 

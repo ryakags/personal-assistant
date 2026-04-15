@@ -4,7 +4,7 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks
+from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks, search_contacts, update_people_involved
 from claude_client import get_claude_response
 
 logging.basicConfig(level=logging.INFO)
@@ -25,17 +25,20 @@ You also have access to the user's Notion calendar. When the user wants to revie
 INTENT_PROMPT = """You are analyzing a message to determine the user's intent.
 
 Return a JSON object with:
-- "intent": one of "review", "add_to_calendar", "edit_page", or "general"
+- "intent": one of "review", "add_to_calendar", "edit_page", "update_people", or "general"
 - "date": ISO date string like "2026-04-13" or null
 - "event_type": Notion event type or null (e.g. "Exercise", "Dinner", "Lunch", "Coffee", "Meeting")
 - "name_query": partial name to search for, or null
-- "days_back": how many days back to search (default 1, for review/edit_page intent only)
+- "days_back": how many days back to search (default 1, for review/edit_page/update_people intent only)
+- "action": "add" or "remove" (for update_people intent only), or null
+- "contact_name": first name of the person to add/remove (for update_people intent only), or null
 
 Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation, Lunch, Party, Coffee, FaceTime, Happy Hour, Sports, Wedding, Festival, Work, Food, Remote Work Trip, Haircut, Movie, Coffee Club, Podcast, Appointment, Art, Date, Comedy Show, Basketball, Therapy, Birthday, Drinks, Hangout, Grocery, Laundry, Beach, Airport, Speaker Event, Open Mic, Errand, Breakfast, Cowork, Cultural Event, Volunteering, Sick, Music, Art Show, Doctors, Pop Up, Bars, Project Work, Travel, Brunch, Self Care, Theater, Trivia, Meeting, Broadway, Bars, Clubbing, Baseball, Bachelor Party, House Warming, Visitors, Short Trip, Holiday Trip
 
 "add_to_calendar" intent examples: "add dinner with Jake to my calendar", "put my workout on the cal", "add to my notion", "create a calendar event for lunch tomorrow", "schedule a meeting for friday"
 "review" intent examples: "let's recap my workout today", "review dinner with Sarah last night", "recap my meeting"
 "edit_page" intent examples: "update my workout today", "add notes to my dinner last night", "edit my meeting from this morning", "I want to add something to today's workout page"
+"update_people" intent examples: "add Jake to my dinner last night", "remove Sarah from my meeting today", "add Mike to last night's event"
 "general" intent: everything else
 
 Today's date is: {today}
@@ -174,6 +177,9 @@ def handle_message(chat_guid: str, sender: str, text: str):
     if session.get("state") == "selecting_event_for_edit":
         handle_edit_page_response(chat_guid, sender, text, session)
         return
+    if session.get("state") in ("updating_people", "selecting_event_for_people", "selecting_contact_for_people"):
+        handle_update_people_response(chat_guid, sender, text, session)
+        return
 
     # Detect intent
     intent = detect_intent(text)
@@ -185,6 +191,8 @@ def handle_message(chat_guid: str, sender: str, text: str):
         start_create_event_session(chat_guid, sender, text)
     elif intent and intent.get("intent") == "edit_page":
         start_edit_page_session(chat_guid, sender, text, intent)
+    elif intent and intent.get("intent") == "update_people":
+        start_update_people_session(chat_guid, sender, text, intent)
     else:
         handle_general_message(chat_guid, sender, text)
 
@@ -508,6 +516,125 @@ def finalize_page_edit(chat_guid: str, sender: str, event: dict, parsed: dict):
     closing = parsed.get("closing_message", "Added to your Notion page!")
     msg = closing if success else f"{closing}\n\n(Couldn't save to Notion — check the connection.)"
     send_message(chat_guid, msg)
+    sessions.pop(sender, None)
+
+
+# ── UPDATE PEOPLE SESSION ──────────────────────────────────────
+
+def start_update_people_session(chat_guid: str, sender: str, text: str, intent: dict):
+    action = intent.get("action", "add")
+    contact_name = intent.get("contact_name")
+
+    if not contact_name:
+        send_message(chat_guid, "Who do you want to add or remove?")
+        sessions[sender] = {"state": "updating_people", "action": action, "event": None, "chat_guid": chat_guid}
+        return
+
+    events = search_events(
+        query_date=intent.get("date"),
+        event_type=intent.get("event_type"),
+        name_query=intent.get("name_query"),
+        days_back=intent.get("days_back", 1)
+    )
+
+    if not events:
+        send_message(chat_guid, "I couldn't find any matching events. Can you be more specific?")
+        return
+
+    if len(events) == 1:
+        resolve_contact_for_event(chat_guid, sender, events[0], action, contact_name)
+    else:
+        event_list = "\n".join([
+            f"{i+1}. {e['name']} ({e['type']}) — {e['scheduled'][:10]}"
+            for i, e in enumerate(events[:5])
+        ])
+        sessions[sender] = {
+            "state": "selecting_event_for_people",
+            "events": events[:5],
+            "action": action,
+            "contact_name": contact_name,
+            "chat_guid": chat_guid
+        }
+        send_message(chat_guid, f"Which event?\n\n{event_list}")
+
+
+def resolve_contact_for_event(chat_guid: str, sender: str, event: dict, action: str, contact_name: str):
+    contacts = search_contacts(contact_name)
+
+    if not contacts:
+        send_message(chat_guid, f"I couldn't find anyone named {contact_name} in your contacts.")
+        return
+
+    if len(contacts) == 1:
+        finalize_people_update(chat_guid, sender, event, action, contacts[0])
+    else:
+        contact_list = "\n".join([
+            f"{i+1}. {c['name']}" + (f" (last saw {c['last_saw'][:10]})" if c.get('last_saw') else "")
+            for i, c in enumerate(contacts[:5])
+        ])
+        sessions[sender] = {
+            "state": "selecting_contact_for_people",
+            "event": event,
+            "action": action,
+            "contacts": contacts[:5],
+            "chat_guid": chat_guid
+        }
+        send_message(chat_guid, f"Which {contact_name}?\n\n{contact_list}")
+
+
+def handle_update_people_response(chat_guid: str, sender: str, text: str, session: dict):
+    state = session.get("state")
+
+    if state == "selecting_event_for_people":
+        try:
+            idx = int(text.strip()) - 1
+            events = session.get("events", [])
+            if 0 <= idx < len(events):
+                resolve_contact_for_event(chat_guid, sender, events[idx], session["action"], session["contact_name"])
+            else:
+                send_message(chat_guid, "Please reply with a number from the list.")
+        except ValueError:
+            send_message(chat_guid, "Please reply with the number of the event.")
+        return
+
+    if state == "selecting_contact_for_people":
+        try:
+            idx = int(text.strip()) - 1
+            contacts = session.get("contacts", [])
+            if 0 <= idx < len(contacts):
+                finalize_people_update(chat_guid, sender, session["event"], session["action"], contacts[idx])
+            else:
+                send_message(chat_guid, "Please reply with a number from the list.")
+        except ValueError:
+            send_message(chat_guid, "Please reply with the number of the contact.")
+        return
+
+
+def finalize_people_update(chat_guid: str, sender: str, event: dict, action: str, contact: dict):
+    current_ids = event.get("people_ids", [])
+
+    if action == "add":
+        if contact["id"] in current_ids:
+            send_message(chat_guid, f"{contact['name']} is already on {event['name']}.")
+            sessions.pop(sender, None)
+            return
+        new_ids = current_ids + [contact["id"]]
+        verb = "Added"
+        prep = "to"
+    else:
+        if contact["id"] not in current_ids:
+            send_message(chat_guid, f"{contact['name']} isn't on {event['name']}.")
+            sessions.pop(sender, None)
+            return
+        new_ids = [cid for cid in current_ids if cid != contact["id"]]
+        verb = "Removed"
+        prep = "from"
+
+    success = update_people_involved(event["id"], new_ids)
+    if success:
+        send_message(chat_guid, f"{verb} {contact['name']} {prep} {event['name']}.")
+    else:
+        send_message(chat_guid, f"Couldn't update People Involved — check the Notion connection.")
     sessions.pop(sender, None)
 
 
