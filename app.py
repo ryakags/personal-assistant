@@ -643,11 +643,9 @@ def finalize_people_update(chat_guid: str, sender: str, event: dict, action: str
 # ── GENERAL ────────────────────────────────────────────────────
 
 def handle_general_message(chat_guid: str, sender: str, text: str):
-    word_count = len(text.split())
-    model = "claude-haiku-4-5" if word_count < 50 else "claude-sonnet-4-6"
-    logger.info(f"General message, routing to {model}")
+    logger.info("General message, routing to claude-sonnet-4-6")
     messages = [{"role": "user", "content": text}]
-    response = get_claude_response(SYSTEM_PROMPT, messages, model=model, enable_web_search=True)
+    response = get_claude_response(SYSTEM_PROMPT, messages, enable_web_search=True)
     send_message(chat_guid, response)
 
 
