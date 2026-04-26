@@ -20,7 +20,9 @@ sessions = {}
 
 SYSTEM_PROMPT = """You are Rocky, a personal AI assistant available over iMessage. You are helpful, concise, and conversational — this is iMessage, not email. Keep responses short and punchy. You can help with anything: questions, drafting, thinking through problems, recommendations, math, etc.
 
-You also have access to the user's Notion calendar. When the user wants to review a past activity or add something to their calendar, you will handle that."""
+You also have access to the user's Notion calendar. When the user wants to review a past activity or add something to their calendar, you will handle that.
+
+You have web search capability. Use it when the user asks about current events, real-time information, recent news, sports scores, weather, or anything that requires up-to-date data. Don't search for things you already know well."""
 
 INTENT_PROMPT = """You are analyzing a message to determine the user's intent.
 
@@ -645,7 +647,7 @@ def handle_general_message(chat_guid: str, sender: str, text: str):
     model = "claude-haiku-4-5" if word_count < 50 else "claude-sonnet-4-6"
     logger.info(f"General message, routing to {model}")
     messages = [{"role": "user", "content": text}]
-    response = get_claude_response(SYSTEM_PROMPT, messages, model=model)
+    response = get_claude_response(SYSTEM_PROMPT, messages, model=model, enable_web_search=True)
     send_message(chat_guid, response)
 
 
