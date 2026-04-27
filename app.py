@@ -35,6 +35,7 @@ Return a JSON object with:
 - "days_ahead": how many days ahead to look (for query_calendar intent only, default 7)
 - "action": "add" or "remove" (for update_people intent only), or null
 - "contact_name": first name of the person to add/remove (for update_people intent only), or null
+- "needs_web_search": true if the message requires real-time or current information (news, scores, weather, stock prices, recent events), false otherwise
 
 Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation, Lunch, Party, Coffee, FaceTime, Happy Hour, Sports, Wedding, Festival, Work, Food, Remote Work Trip, Haircut, Movie, Coffee Club, Podcast, Appointment, Art, Date, Comedy Show, Basketball, Therapy, Birthday, Drinks, Hangout, Grocery, Laundry, Beach, Airport, Speaker Event, Open Mic, Errand, Breakfast, Cowork, Cultural Event, Volunteering, Sick, Music, Art Show, Doctors, Pop Up, Bars, Project Work, Travel, Brunch, Self Care, Theater, Trivia, Meeting, Broadway, Bars, Clubbing, Baseball, Bachelor Party, House Warming, Visitors, Short Trip, Holiday Trip
 
@@ -200,7 +201,7 @@ def handle_message(chat_guid: str, sender: str, text: str):
     elif intent and intent.get("intent") == "query_calendar":
         handle_calendar_query(chat_guid, sender, text, intent)
     else:
-        handle_general_message(chat_guid, sender, text)
+        handle_general_message(chat_guid, sender, text, needs_web_search=bool(intent and intent.get("needs_web_search")))
 
 
 def detect_intent(text: str) -> dict | None:
@@ -679,10 +680,15 @@ Reply in a friendly, concise iMessage style. Group by day if there are multiple 
 
 # ── GENERAL ────────────────────────────────────────────────────
 
-def handle_general_message(chat_guid: str, sender: str, text: str):
-    logger.info("General message, routing to claude-sonnet-4-6")
-    messages = [{"role": "user", "content": text}]
-    response = get_claude_response(SYSTEM_PROMPT, messages, enable_web_search=True)
+def handle_general_message(chat_guid: str, sender: str, text: str, needs_web_search: bool = False):
+    if needs_web_search:
+        logger.info("General message with web search, routing to claude-sonnet-4-6")
+        response = get_claude_response(SYSTEM_PROMPT, [{"role": "user", "content": text}], enable_web_search=True)
+    else:
+        word_count = len(text.split())
+        model = "claude-haiku-4-5" if word_count < 50 else "claude-sonnet-4-6"
+        logger.info(f"General message, routing to {model}")
+        response = get_claude_response(SYSTEM_PROMPT, [{"role": "user", "content": text}], model=model)
     send_message(chat_guid, response)
 
 
