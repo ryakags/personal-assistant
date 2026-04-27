@@ -331,6 +331,71 @@ def get_upcoming_events(days_ahead: int = 7, date_from: str = None, date_to: str
         return []
 
 
+def get_contacts_by_ids(contact_ids: list) -> list:
+    """Fetch name + id for a list of contact page IDs."""
+    contacts = []
+    for cid in contact_ids:
+        try:
+            response = httpx.get(
+                f"https://api.notion.com/v1/pages/{cid}",
+                headers=_headers(),
+                timeout=10
+            )
+            response.raise_for_status()
+            props = response.json().get("properties", {})
+            name = "".join([t.get("plain_text", "") for t in props.get("Name", {}).get("title", [])])
+            if name:
+                contacts.append({"id": cid, "name": name})
+        except Exception as e:
+            logger.error(f"Error fetching contact {cid}: {e}")
+    return contacts
+
+
+def append_blocks(page_id: str, blocks: list) -> bool:
+    """Append a list of pre-built block dicts to a Notion page."""
+    try:
+        response = httpx.patch(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=_headers(),
+            json={"children": blocks},
+            timeout=15
+        )
+        response.raise_for_status()
+        logger.info(f"Appended {len(blocks)} blocks to {page_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error appending blocks to {page_id}: {e}", exc_info=True)
+        return False
+
+
+def write_contact_recap(contact_id: str, event_name: str, event_date: str, bullets: list, facts: list) -> bool:
+    """Append an event recap section to a contact's Notion page."""
+    blocks = [{
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"{event_name} — {event_date}"}}]}
+    }]
+    for bullet in bullets:
+        blocks.append({
+            "object": "block",
+            "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": bullet}}]}
+        })
+    if facts:
+        blocks.append({
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": {"rich_text": [{"type": "text", "text": {"content": "Personal Facts"}}]}
+        })
+        for fact in facts:
+            blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": fact}}]}
+            })
+    return append_blocks(contact_id, blocks)
+
+
 def get_todays_events() -> list:
     """Get today's events - kept for backwards compatibility."""
     today = datetime.now().strftime("%Y-%m-%d")

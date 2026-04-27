@@ -4,7 +4,7 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks, search_contacts, update_people_involved, get_upcoming_events, create_contact
+from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks, append_blocks, search_contacts, update_people_involved, get_upcoming_events, create_contact, get_contacts_by_ids, write_contact_recap
 from claude_client import get_claude_response
 
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +27,7 @@ You have web search capability. Use it when the user asks about current events, 
 INTENT_PROMPT = """You are analyzing a message to determine the user's intent.
 
 Return a JSON object with:
-- "intent": one of "review", "add_to_calendar", "edit_page", "update_people", "query_calendar", or "general"
+- "intent": one of "recap", "add_to_calendar", "edit_page", "update_people", "query_calendar", or "general"
 - "date": ISO date string like "2026-04-13" or null
 - "event_type": Notion event type or null (e.g. "Exercise", "Dinner", "Lunch", "Coffee", "Meeting")
 - "name_query": partial name to search for, or null
@@ -40,7 +40,7 @@ Return a JSON object with:
 Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation, Lunch, Party, Coffee, FaceTime, Happy Hour, Sports, Wedding, Festival, Work, Food, Remote Work Trip, Haircut, Movie, Coffee Club, Podcast, Appointment, Art, Date, Comedy Show, Basketball, Therapy, Birthday, Drinks, Hangout, Grocery, Laundry, Beach, Airport, Speaker Event, Open Mic, Errand, Breakfast, Cowork, Cultural Event, Volunteering, Sick, Music, Art Show, Doctors, Pop Up, Bars, Project Work, Travel, Brunch, Self Care, Theater, Trivia, Meeting, Broadway, Bars, Clubbing, Baseball, Bachelor Party, House Warming, Visitors, Short Trip, Holiday Trip
 
 "add_to_calendar" intent examples: "add dinner with Jake to my calendar", "put my workout on the cal", "add to my notion", "create a calendar event for lunch tomorrow", "schedule a meeting for friday"
-"review" intent examples: "let's recap my workout today", "review dinner with Sarah last night", "recap my meeting"
+"recap" intent examples: "let's recap my workout today", "review dinner with Sarah last night", "recap my meeting", "recap dinner", "let's do a recap"
 "edit_page" intent examples: "update my workout today", "add notes to my dinner last night", "edit my meeting from this morning", "I want to add something to today's workout page"
 "update_people" intent examples: "add Jake to my dinner last night", "remove Sarah from my meeting today", "add Mike to last night's event"
 "query_calendar" intent examples: "what's on my calendar this week?", "what do I have coming up?", "what are my plans for tomorrow?", "show me my schedule", "what's on my calendar today?", "anything on my calendar this weekend?". Use days_ahead: 1 for today/tomorrow, 7 for this week, 14 for next two weeks, 30 for this month.
@@ -87,6 +87,35 @@ Your job is to collect what the user wants to add to the page body. Keep it shor
 - If not, ask once: "What do you want to add to this page?"
 - Once you have content, respond with ONLY this JSON:
 {{"ready": true, "content": "The notes to append verbatim", "closing_message": "Short friendly confirmation"}}"""
+
+
+RECAP_PROMPT = """You are processing an event recap for a personal Notion database.
+
+Event: {event_name} ({event_type}) on {event_date}
+People Involved: {contact_names}
+
+The user's recap notes:
+{recap_text}
+
+Return a JSON object with:
+{{
+  "event_summary": "3-5 sentence structured summary of what happened",
+  "contacts": [
+    {{
+      "name": "Contact name exactly as listed in People Involved",
+      "bullets": ["Key thing about this person at the event", "Another notable moment"],
+      "facts": ["Personal fact or life update mentioned", "Another fact"]
+    }}
+  ],
+  "closing_message": "Short punchy iMessage confirmation of what was saved"
+}}
+
+Rules:
+- event_summary: past tense, structured and clear
+- For each contact in People Involved, write 1-3 bullets about their involvement and extract personal facts (job changes, life updates, opinions, plans, preferences, health, relationships, etc.)
+- Only include a contact in the array if they were actually mentioned in the recap notes
+- facts can be [] if nothing personal was mentioned about them
+- Respond with ONLY the JSON"""
 
 
 def send_message(chat_guid: str, text: str):
@@ -167,11 +196,8 @@ def handle_message(chat_guid: str, sender: str, text: str):
     session = sessions.get(sender, {})
 
     # Continue active sessions
-    if session.get("state") == "reviewing":
-        handle_review_response(chat_guid, sender, text, session)
-        return
-    if session.get("state") == "selecting_event":
-        handle_review_response(chat_guid, sender, text, session)
+    if session.get("state") in ("recapping", "selecting_event_for_recap"):
+        handle_recap_response(chat_guid, sender, text, session)
         return
     if session.get("state") == "creating_event":
         handle_create_event_response(chat_guid, sender, text, session)
@@ -190,8 +216,8 @@ def handle_message(chat_guid: str, sender: str, text: str):
     intent = detect_intent(text)
     logger.info(f"Detected intent: {intent}")
 
-    if intent and intent.get("intent") == "review":
-        start_review_session(chat_guid, sender, text, intent)
+    if intent and intent.get("intent") == "recap":
+        start_recap_session(chat_guid, sender, text, intent)
     elif intent and intent.get("intent") == "add_to_calendar":
         start_create_event_session(chat_guid, sender, text)
     elif intent and intent.get("intent") == "edit_page":
@@ -227,9 +253,9 @@ def detect_intent(text: str) -> dict | None:
         return None
 
 
-# ── REVIEW SESSION ──────────────────────────────────────────────
+# ── RECAP SESSION ───────────────────────────────────────────────
 
-def start_review_session(chat_guid: str, sender: str, text: str, intent: dict):
+def start_recap_session(chat_guid: str, sender: str, text: str, intent: dict):
     events = search_events_with_fallback(
         query_date=intent.get("date"),
         event_type=intent.get("event_type"),
@@ -242,106 +268,119 @@ def start_review_session(chat_guid: str, sender: str, text: str, intent: dict):
         return
 
     if len(events) == 1:
-        start_event_review(chat_guid, sender, events[0])
+        start_event_recap(chat_guid, sender, events[0])
     else:
         event_list = "\n".join([
             f"{i+1}. {e['name']} ({e['type']}) — {e['scheduled'][:10]}"
             for i, e in enumerate(events[:5])
         ])
         sessions[sender] = {
-            "state": "selecting_event",
+            "state": "selecting_event_for_recap",
             "events": events[:5],
             "chat_guid": chat_guid
         }
         send_message(chat_guid, f"Found a few events. Which one?\n\n{event_list}")
 
 
-def start_event_review(chat_guid: str, sender: str, event: dict):
+def start_event_recap(chat_guid: str, sender: str, event: dict):
     sessions[sender] = {
-        "state": "reviewing",
+        "state": "recapping",
         "event": event,
-        "history": [],
+        "messages": [],
         "chat_guid": chat_guid
     }
-
-    review_system = build_review_system_prompt(event)
-    event_desc = event['name']
-    if event.get('scheduled'):
+    event_desc = event["name"]
+    if event.get("scheduled"):
         event_desc += f" on {event['scheduled'][:10]}"
-    opening_messages = [{"role": "user", "content": f"Let's review: {event_desc}"}]
-    opening = get_claude_response(review_system, opening_messages, model="claude-sonnet-4-6")
-
-    sessions[sender]["history"].append({"role": "assistant", "content": opening})
-    send_message(chat_guid, opening)
+    send_message(chat_guid, f"Recap mode for {event_desc}. Dump everything — say 'done' when you're finished.")
 
 
-def handle_review_response(chat_guid: str, sender: str, text: str, session: dict):
-    if session.get("state") == "selecting_event":
+def handle_recap_response(chat_guid: str, sender: str, text: str, session: dict):
+    if session.get("state") == "selecting_event_for_recap":
         try:
             idx = int(text.strip()) - 1
             events = session.get("events", [])
             if 0 <= idx < len(events):
-                start_event_review(chat_guid, sender, events[idx])
+                start_event_recap(chat_guid, sender, events[idx])
             else:
                 send_message(chat_guid, "Please reply with a number from the list.")
         except ValueError:
-            send_message(chat_guid, "Please reply with the number of the event you want to review.")
+            send_message(chat_guid, "Please reply with the number of the event.")
         return
 
-    event = session["event"]
-    history = session["history"]
-    history.append({"role": "user", "content": text})
+    if text.strip().lower() == "done":
+        messages = session.get("messages", [])
+        if not messages:
+            send_message(chat_guid, "You haven't shared anything yet — tell me about the event first.")
+            return
+        send_message(chat_guid, "Give me a sec...")
+        finalize_recap(chat_guid, sender, session)
+    else:
+        session["messages"].append(text)
+        sessions[sender] = session
 
-    review_system = build_review_system_prompt(event)
-    word_count = len(text.split())
-    model = "claude-haiku-4-5" if word_count < 50 else "claude-sonnet-4-6"
-    response_text = get_claude_response(review_system, history, model=model)
+
+def finalize_recap(chat_guid: str, sender: str, session: dict):
+    event = session["event"]
+    recap_text = "\n".join(session["messages"])
+    event_date = event.get("scheduled", "")[:10] if event.get("scheduled") else "Unknown"
+
+    contacts = get_contacts_by_ids(event.get("people_ids", []))
+    contact_names = ", ".join([c["name"] for c in contacts]) if contacts else "None listed"
+
+    prompt = RECAP_PROMPT.format(
+        event_name=event.get("name", "Unknown"),
+        event_type=event.get("type", "Unknown"),
+        event_date=event_date,
+        contact_names=contact_names,
+        recap_text=recap_text
+    )
 
     try:
-        start = response_text.find("{")
-        end = response_text.rfind("}") + 1
-        if start >= 0 and end > start:
-            parsed = json.loads(response_text[start:end])
-            if parsed.get("done"):
-                summary = parsed.get("summary", "")
-                closing = parsed.get("closing_message", "Saved to Notion! ✅")
-                success = write_event_notes(event["id"], summary)
-                msg = closing if success else f"{closing}\n\n(Couldn't save to Notion — check the connection.)"
-                send_message(chat_guid, msg)
-                sessions.pop(sender, None)
-                return
-    except (json.JSONDecodeError, ValueError):
-        pass
+        raw = get_claude_response(prompt, [{"role": "user", "content": "Process this recap."}], model="claude-sonnet-4-6")
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        parsed = json.loads(raw[start:end])
+    except Exception as e:
+        logger.error(f"Error parsing recap response: {e}")
+        send_message(chat_guid, "Had trouble processing the recap — try again?")
+        sessions.pop(sender, None)
+        return
 
-    history.append({"role": "assistant", "content": response_text})
-    session["history"] = history
-    sessions[sender] = session
-    send_message(chat_guid, response_text)
+    # Write summary to event page body
+    event_blocks = [
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"Recap — {event_date}"}}]}
+        },
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": parsed.get("event_summary", "")}}]}
+        }
+    ]
+    append_blocks(event["id"], event_blocks)
 
+    # Write to each contact page
+    contact_map = {c["name"].lower(): c["id"] for c in contacts}
+    updated_contacts = []
+    for c_data in parsed.get("contacts", []):
+        name = c_data.get("name", "")
+        cid = contact_map.get(name.lower())
+        if not cid:
+            continue
+        write_contact_recap(
+            contact_id=cid,
+            event_name=event.get("name", ""),
+            event_date=event_date,
+            bullets=c_data.get("bullets", []),
+            facts=c_data.get("facts", [])
+        )
+        updated_contacts.append(name)
 
-def build_review_system_prompt(event: dict) -> str:
-    existing_notes = event.get("notes", "")
-    notes_context = f"\nExisting notes: {existing_notes}" if existing_notes else ""
-
-    return f"""You are Rocky, a personal AI assistant conducting a review of a calendar event over iMessage.
-
-Event details:
-- Name: {event.get('name', 'Unknown')}
-- Type: {event.get('type', 'Unknown')}
-- Date: {event.get('scheduled', 'Unknown')[:10] if event.get('scheduled') else 'Unknown'}
-- Location: {event.get('location', 'Not specified')}{notes_context}
-
-Your job is to have a short, natural conversation to capture what happened. Keep it casual — this is iMessage.
-
-RULES:
-- Ask 2-3 focused questions max, all in one message
-- Keep messages short
-- After 1-2 rounds of answers, wrap up
-
-When you have enough info, respond with ONLY this JSON:
-{{"done": true, "summary": "Concise summary, 2-5 sentences.", "closing_message": "Short friendly closing"}}
-
-Start by acknowledging the event and asking your first questions."""
+    send_message(chat_guid, parsed.get("closing_message", "Recap saved!"))
+    sessions.pop(sender, None)
 
 
 # ── CREATE EVENT SESSION ────────────────────────────────────────
