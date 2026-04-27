@@ -3,7 +3,7 @@ import json
 import logging
 import requests
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timedelta
 from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks, append_blocks, search_contacts, update_people_involved, get_upcoming_events, create_contact, get_contacts_by_ids, write_contact_recap, write_contact_summary
 from claude_client import get_claude_response
 
@@ -43,7 +43,7 @@ Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation,
 "recap" intent examples: "let's recap my workout today", "review dinner with Sarah last night", "recap my meeting", "recap dinner", "let's do a recap"
 "edit_page" intent examples: "update my workout today", "add notes to my dinner last night", "edit my meeting from this morning", "I want to add something to today's workout page"
 "update_people" intent examples: "add Jake to my dinner last night", "remove Sarah from my meeting today", "add Mike to last night's event"
-"query_calendar" intent examples: "what's on my calendar this week?", "what do I have coming up?", "what are my plans for tomorrow?", "show me my schedule", "what's on my calendar today?", "anything on my calendar this weekend?". Use days_ahead: 1 for today/tomorrow, 7 for this week, 14 for next two weeks, 30 for this month.
+"query_calendar" intent examples: "what's on my calendar this week?", "what do I have coming up?", "what are my plans for tomorrow?", "show me my schedule", "what's on my calendar today?", "anything on my calendar this weekend?", "what did I do last week?", "show me last month", "what was on my calendar in March?", "what did I do yesterday?". Use days_ahead for future queries (1=today/tomorrow, 7=this week, 14=two weeks, 30=month). Use days_back for past queries (1=yesterday/today, 7=last week, 30=last month). Set whichever is relevant and leave the other null.
 "update_contact" intent examples: "update Jake", "add notes about Sarah", "update my contact for Mike", "add a summary for Jessica", "update [name]'s profile". Use contact_name field.
 "general" intent: everything else
 
@@ -853,14 +853,27 @@ def finalize_contact_note(chat_guid: str, sender: str, session: dict):
 # ── CALENDAR QUERY ─────────────────────────────────────────────
 
 def handle_calendar_query(chat_guid: str, sender: str, text: str, intent: dict):
-    days_ahead = intent.get("days_ahead") or 7
-    events = get_upcoming_events(days_ahead=days_ahead)
+    today = datetime.now()
+    days_back = intent.get("days_back")
+    days_ahead = intent.get("days_ahead")
+
+    if days_back and not days_ahead:
+        date_from = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        date_to = today.strftime("%Y-%m-%d")
+    elif days_ahead and not days_back:
+        date_from = today.strftime("%Y-%m-%d")
+        date_to = (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    else:
+        date_from = today.strftime("%Y-%m-%d")
+        date_to = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    events = get_upcoming_events(date_from=date_from, date_to=date_to)
 
     if not events:
         send_message(chat_guid, "Nothing on your calendar for that period!")
         return
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = today.strftime("%Y-%m-%d")
     event_lines = []
     for e in events:
         date = e["scheduled"][:10] if e.get("scheduled") else "?"
