@@ -396,6 +396,21 @@ def write_contact_recap(contact_id: str, event_name: str, event_date: str, bulle
     return append_blocks(contact_id, blocks)
 
 
+def write_contact_summary(contact_id: str, bullets: list) -> bool:
+    blocks = [{
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Summary"}}]}
+    }]
+    for bullet in bullets:
+        blocks.append({
+            "object": "block",
+            "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": bullet}}]}
+        })
+    return append_blocks(contact_id, blocks)
+
+
 def get_todays_events() -> list:
     """Get today's events - kept for backwards compatibility."""
     today = datetime.now().strftime("%Y-%m-%d")

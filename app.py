@@ -4,7 +4,7 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks, append_blocks, search_contacts, update_people_involved, get_upcoming_events, create_contact, get_contacts_by_ids, write_contact_recap
+from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks, append_blocks, search_contacts, update_people_involved, get_upcoming_events, create_contact, get_contacts_by_ids, write_contact_recap, write_contact_summary
 from claude_client import get_claude_response
 
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +27,7 @@ You have web search capability. Use it when the user asks about current events, 
 INTENT_PROMPT = """You are analyzing a message to determine the user's intent.
 
 Return a JSON object with:
-- "intent": one of "recap", "add_to_calendar", "edit_page", "update_people", "query_calendar", or "general"
+- "intent": one of "recap", "add_to_calendar", "edit_page", "update_people", "update_contact", "query_calendar", or "general"
 - "date": ISO date string like "2026-04-13" or null
 - "event_type": Notion event type or null (e.g. "Exercise", "Dinner", "Lunch", "Coffee", "Meeting")
 - "name_query": partial name to search for, or null
@@ -44,6 +44,7 @@ Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation,
 "edit_page" intent examples: "update my workout today", "add notes to my dinner last night", "edit my meeting from this morning", "I want to add something to today's workout page"
 "update_people" intent examples: "add Jake to my dinner last night", "remove Sarah from my meeting today", "add Mike to last night's event"
 "query_calendar" intent examples: "what's on my calendar this week?", "what do I have coming up?", "what are my plans for tomorrow?", "show me my schedule", "what's on my calendar today?", "anything on my calendar this weekend?". Use days_ahead: 1 for today/tomorrow, 7 for this week, 14 for next two weeks, 30 for this month.
+"update_contact" intent examples: "update Jake", "add notes about Sarah", "update my contact for Mike", "add a summary for Jessica", "update [name]'s profile". Use contact_name field.
 "general" intent: everything else
 
 Today's date is: {today}
@@ -115,6 +116,26 @@ Rules:
 - For each contact in People Involved, write 1-3 bullets about their involvement and extract personal facts (job changes, life updates, opinions, plans, preferences, health, relationships, etc.)
 - Only include a contact in the array if they were actually mentioned in the recap notes
 - facts can be [] if nothing personal was mentioned about them
+- Respond with ONLY the JSON"""
+
+
+CONTACT_NOTE_PROMPT = """You are updating a contact profile in a personal Notion database.
+
+Contact: {contact_name}
+
+The user's notes about this person:
+{notes_text}
+
+Return a JSON object with:
+{{
+  "bullets": ["Fact or note about this person", "Another fact"],
+  "closing_message": "Short iMessage-style confirmation"
+}}
+
+Rules:
+- Extract key facts and notes: job/career, location, family, interests, how they know them, recent life updates, personality, anything worth remembering
+- Each bullet is a clear standalone fact
+- 5-15 bullets depending on how much was shared
 - Respond with ONLY the JSON"""
 
 
@@ -208,6 +229,9 @@ def handle_message(chat_guid: str, sender: str, text: str):
     if session.get("state") == "selecting_event_for_edit":
         handle_edit_page_response(chat_guid, sender, text, session)
         return
+    if session.get("state") in ("noting_contact", "selecting_contact_for_note"):
+        handle_contact_note_response(chat_guid, sender, text, session)
+        return
     if session.get("state") in ("updating_people", "selecting_event_for_people", "selecting_contact_for_people", "creating_contact"):
         handle_update_people_response(chat_guid, sender, text, session)
         return
@@ -224,6 +248,8 @@ def handle_message(chat_guid: str, sender: str, text: str):
         start_edit_page_session(chat_guid, sender, text, intent)
     elif intent and intent.get("intent") == "update_people":
         start_update_people_session(chat_guid, sender, text, intent)
+    elif intent and intent.get("intent") == "update_contact":
+        start_contact_note_session(chat_guid, sender, text, intent)
     elif intent and intent.get("intent") == "query_calendar":
         handle_calendar_query(chat_guid, sender, text, intent)
     else:
@@ -709,6 +735,118 @@ def finalize_people_update(chat_guid: str, sender: str, event: dict, action: str
         send_message(chat_guid, f"{verb} {contact['name']} {prep} {event['name']}.")
     else:
         send_message(chat_guid, f"Couldn't update People Involved — check the Notion connection.")
+    sessions.pop(sender, None)
+
+
+# ── CONTACT NOTE SESSION ───────────────────────────────────────
+
+def start_contact_note_session(chat_guid: str, sender: str, text: str, intent: dict):
+    contact_name = intent.get("contact_name")
+    if not contact_name:
+        send_message(chat_guid, "Who do you want to update?")
+        sessions[sender] = {"state": "noting_contact", "contact": None, "messages": [], "chat_guid": chat_guid}
+        return
+
+    contacts = search_contacts(contact_name)
+
+    if not contacts:
+        send_message(chat_guid, f"No contact found for {contact_name}. Add them first with 'add {contact_name} to [event]'.")
+        return
+
+    if len(contacts) == 1:
+        start_contact_note(chat_guid, sender, contacts[0])
+    else:
+        top = contacts[:3]
+        contact_list = "\n".join([
+            f"{i+1}. {c['name']}" + (f" (last saw {c['last_saw'][:10]})" if c.get('last_saw') else "")
+            for i, c in enumerate(top)
+        ])
+        sessions[sender] = {
+            "state": "selecting_contact_for_note",
+            "contacts": top,
+            "chat_guid": chat_guid
+        }
+        send_message(chat_guid, f"Which {contact_name}?\n\n{contact_list}")
+
+
+def start_contact_note(chat_guid: str, sender: str, contact: dict):
+    sessions[sender] = {
+        "state": "noting_contact",
+        "contact": contact,
+        "messages": [],
+        "chat_guid": chat_guid
+    }
+    send_message(chat_guid, f"What do you know about {contact['name']}? Dump everything — say 'done' when finished.")
+
+
+def handle_contact_note_response(chat_guid: str, sender: str, text: str, session: dict):
+    if session.get("state") == "selecting_contact_for_note":
+        try:
+            idx = int(text.strip()) - 1
+            contacts = session.get("contacts", [])
+            if 0 <= idx < len(contacts):
+                start_contact_note(chat_guid, sender, contacts[idx])
+            else:
+                send_message(chat_guid, "Please reply with a number from the list.")
+        except ValueError:
+            send_message(chat_guid, "Please reply with the number of the contact.")
+        return
+
+    if not session.get("contact"):
+        contacts = search_contacts(text.strip())
+        if not contacts:
+            send_message(chat_guid, f"No contact found for {text.strip()}.")
+            sessions.pop(sender, None)
+        elif len(contacts) == 1:
+            start_contact_note(chat_guid, sender, contacts[0])
+        else:
+            top = contacts[:3]
+            contact_list = "\n".join([
+                f"{i+1}. {c['name']}" + (f" (last saw {c['last_saw'][:10]})" if c.get('last_saw') else "")
+                for i, c in enumerate(top)
+            ])
+            session["state"] = "selecting_contact_for_note"
+            session["contacts"] = top
+            sessions[sender] = session
+            send_message(chat_guid, f"Which one?\n\n{contact_list}")
+        return
+
+    if text.strip().lower() == "done":
+        if not session.get("messages"):
+            send_message(chat_guid, "You haven't shared anything yet — tell me about them first.")
+            return
+        send_message(chat_guid, "Give me a sec...")
+        finalize_contact_note(chat_guid, sender, session)
+    else:
+        session["messages"].append(text)
+        sessions[sender] = session
+
+
+def finalize_contact_note(chat_guid: str, sender: str, session: dict):
+    contact = session["contact"]
+    notes_text = "\n".join(session["messages"])
+
+    prompt = CONTACT_NOTE_PROMPT.format(
+        contact_name=contact["name"],
+        notes_text=notes_text
+    )
+
+    try:
+        raw = get_claude_response(prompt, [{"role": "user", "content": "Process these notes."}], model="claude-sonnet-4-6")
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        parsed = json.loads(raw[start:end])
+    except Exception as e:
+        logger.error(f"Error parsing contact note response: {e}")
+        send_message(chat_guid, "Had trouble processing — try again?")
+        sessions.pop(sender, None)
+        return
+
+    success = write_contact_summary(contact["id"], parsed.get("bullets", []))
+    if success:
+        send_message(chat_guid, parsed.get("closing_message", f"Updated {contact['name']}'s profile!"))
+    else:
+        send_message(chat_guid, f"Couldn't write to Notion — check the connection.")
     sessions.pop(sender, None)
 
 
