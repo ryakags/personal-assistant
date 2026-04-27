@@ -204,6 +204,13 @@ def handle_message(chat_guid: str, sender: str, text: str):
         handle_general_message(chat_guid, sender, text, needs_web_search=bool(intent and intent.get("needs_web_search")))
 
 
+def search_events_with_fallback(query_date, event_type, name_query, days_back):
+    events = search_events(query_date=query_date, event_type=event_type, name_query=name_query, days_back=days_back)
+    if not events and event_type:
+        events = search_events(query_date=query_date, name_query=name_query, days_back=days_back)
+    return events
+
+
 def detect_intent(text: str) -> dict | None:
     try:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -223,7 +230,7 @@ def detect_intent(text: str) -> dict | None:
 # ── REVIEW SESSION ──────────────────────────────────────────────
 
 def start_review_session(chat_guid: str, sender: str, text: str, intent: dict):
-    events = search_events(
+    events = search_events_with_fallback(
         query_date=intent.get("date"),
         event_type=intent.get("event_type"),
         name_query=intent.get("name_query"),
@@ -417,7 +424,7 @@ def finalize_event_creation(chat_guid: str, sender: str, event_data: dict):
 # ── EDIT PAGE SESSION ──────────────────────────────────────────
 
 def start_edit_page_session(chat_guid: str, sender: str, text: str, intent: dict):
-    events = search_events(
+    events = search_events_with_fallback(
         query_date=intent.get("date"),
         event_type=intent.get("event_type"),
         name_query=intent.get("name_query"),
@@ -537,7 +544,7 @@ def start_update_people_session(chat_guid: str, sender: str, text: str, intent: 
         sessions[sender] = {"state": "updating_people", "action": action, "event": None, "chat_guid": chat_guid}
         return
 
-    events = search_events(
+    events = search_events_with_fallback(
         query_date=intent.get("date"),
         event_type=intent.get("event_type"),
         name_query=intent.get("name_query"),
