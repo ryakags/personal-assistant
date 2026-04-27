@@ -368,12 +368,79 @@ def append_blocks(page_id: str, blocks: list) -> bool:
         return False
 
 
+def get_page_blocks(page_id: str) -> list:
+    """Fetch all top-level blocks of a Notion page (handles pagination)."""
+    blocks = []
+    cursor = None
+    try:
+        while True:
+            params = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            response = httpx.get(
+                f"https://api.notion.com/v1/blocks/{page_id}/children",
+                headers=_headers(),
+                params=params,
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            blocks.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+    except Exception as e:
+        logger.error(f"Error fetching blocks for {page_id}: {e}")
+    return blocks
+
+
+def delete_block(block_id: str) -> None:
+    try:
+        httpx.delete(
+            f"https://api.notion.com/v1/blocks/{block_id}",
+            headers=_headers(),
+            timeout=10
+        ).raise_for_status()
+    except Exception as e:
+        logger.error(f"Error deleting block {block_id}: {e}")
+
+
+def replace_section(page_id: str, heading_text: str, new_blocks: list) -> bool:
+    """
+    Replace an existing heading_2 section (and everything below it until
+    the next heading_2) with new_blocks. If no match is found, just appends.
+    """
+    blocks = get_page_blocks(page_id)
+
+    section_start = None
+    section_end = None
+    for i, block in enumerate(blocks):
+        if block.get("type") == "heading_2":
+            text = "".join(
+                t.get("plain_text", "")
+                for t in block.get("heading_2", {}).get("rich_text", [])
+            )
+            if text == heading_text:
+                section_start = i
+            elif section_start is not None:
+                section_end = i
+                break
+
+    if section_start is not None:
+        to_delete = blocks[section_start:section_end] if section_end else blocks[section_start:]
+        for block in to_delete:
+            delete_block(block["id"])
+
+    return append_blocks(page_id, new_blocks)
+
+
 def write_contact_recap(contact_id: str, event_name: str, event_date: str, bullets: list, facts: list) -> bool:
-    """Append an event recap section to a contact's Notion page."""
+    """Write (or replace) an event recap section on a contact's Notion page."""
+    heading_text = f"{event_name} — {event_date}"
     blocks = [{
         "object": "block",
         "type": "heading_2",
-        "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"{event_name} — {event_date}"}}]}
+        "heading_2": {"rich_text": [{"type": "text", "text": {"content": heading_text}}]}
     }]
     for bullet in bullets:
         blocks.append({
@@ -393,10 +460,11 @@ def write_contact_recap(contact_id: str, event_name: str, event_date: str, bulle
                 "type": "bulleted_list_item",
                 "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": fact}}]}
             })
-    return append_blocks(contact_id, blocks)
+    return replace_section(contact_id, heading_text, blocks)
 
 
 def write_contact_summary(contact_id: str, bullets: list) -> bool:
+    """Write (or replace) the Summary section on a contact's Notion page."""
     blocks = [{
         "object": "block",
         "type": "heading_2",
@@ -408,7 +476,7 @@ def write_contact_summary(contact_id: str, bullets: list) -> bool:
             "type": "bulleted_list_item",
             "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": bullet}}]}
         })
-    return append_blocks(contact_id, blocks)
+    return replace_section(contact_id, "Summary", blocks)
 
 
 def get_todays_events() -> list:
