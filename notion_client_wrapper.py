@@ -251,6 +251,62 @@ def update_people_involved(event_page_id: str, contact_ids: list) -> bool:
         return False
 
 
+def get_upcoming_events(days_ahead: int = 7, date_from: str = None, date_to: str = None) -> list:
+    today = datetime.now().strftime("%Y-%m-%d")
+    start = date_from or today
+    end = date_to or (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+    body = {
+        "filter": {
+            "and": [
+                {"property": "Scheduled", "date": {"on_or_after": start}},
+                {"property": "Scheduled", "date": {"on_or_before": end}}
+            ]
+        },
+        "sorts": [{"property": "Scheduled", "direction": "ascending"}],
+        "page_size": 20
+    }
+
+    try:
+        response = httpx.post(
+            f"https://api.notion.com/v1/databases/{CALENDAR_DB_ID}/query",
+            headers=_headers(),
+            json=body,
+            timeout=10
+        )
+        response.raise_for_status()
+        results = response.json().get("results", [])
+
+        events = []
+        for page in results:
+            props = page.get("properties", {})
+
+            name_prop = props.get("Name", {})
+            name = "".join([t.get("plain_text", "") for t in name_prop.get("title", [])])
+
+            scheduled_prop = props.get("Scheduled", {}).get("date", {})
+            scheduled = scheduled_prop.get("start", "") if scheduled_prop else ""
+
+            type_prop = props.get("Type of Event", {}).get("select", {})
+            event_type_val = type_prop.get("name", "") if type_prop else ""
+
+            location_prop = props.get("Location", {})
+            location = "".join([t.get("plain_text", "") for t in location_prop.get("rich_text", [])])
+
+            events.append({
+                "name": name,
+                "scheduled": scheduled,
+                "type": event_type_val,
+                "location": location
+            })
+
+        return events
+
+    except Exception as e:
+        logger.error(f"Error fetching upcoming events: {e}", exc_info=True)
+        return []
+
+
 def get_todays_events() -> list:
     """Get today's events - kept for backwards compatibility."""
     today = datetime.now().strftime("%Y-%m-%d")

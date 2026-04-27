@@ -4,7 +4,7 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks, search_contacts, update_people_involved
+from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks, search_contacts, update_people_involved, get_upcoming_events
 from claude_client import get_claude_response
 
 logging.basicConfig(level=logging.INFO)
@@ -27,11 +27,12 @@ You have web search capability. Use it when the user asks about current events, 
 INTENT_PROMPT = """You are analyzing a message to determine the user's intent.
 
 Return a JSON object with:
-- "intent": one of "review", "add_to_calendar", "edit_page", "update_people", or "general"
+- "intent": one of "review", "add_to_calendar", "edit_page", "update_people", "query_calendar", or "general"
 - "date": ISO date string like "2026-04-13" or null
 - "event_type": Notion event type or null (e.g. "Exercise", "Dinner", "Lunch", "Coffee", "Meeting")
 - "name_query": partial name to search for, or null
 - "days_back": how many days back to search (default 1, for review/edit_page/update_people intent only)
+- "days_ahead": how many days ahead to look (for query_calendar intent only, default 7)
 - "action": "add" or "remove" (for update_people intent only), or null
 - "contact_name": first name of the person to add/remove (for update_people intent only), or null
 
@@ -41,6 +42,7 @@ Notion event types: Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation,
 "review" intent examples: "let's recap my workout today", "review dinner with Sarah last night", "recap my meeting"
 "edit_page" intent examples: "update my workout today", "add notes to my dinner last night", "edit my meeting from this morning", "I want to add something to today's workout page"
 "update_people" intent examples: "add Jake to my dinner last night", "remove Sarah from my meeting today", "add Mike to last night's event"
+"query_calendar" intent examples: "what's on my calendar this week?", "what do I have coming up?", "what are my plans for tomorrow?", "show me my schedule", "what's on my calendar today?", "anything on my calendar this weekend?". Use days_ahead: 1 for today/tomorrow, 7 for this week, 14 for next two weeks, 30 for this month.
 "general" intent: everything else
 
 Today's date is: {today}
@@ -195,6 +197,8 @@ def handle_message(chat_guid: str, sender: str, text: str):
         start_edit_page_session(chat_guid, sender, text, intent)
     elif intent and intent.get("intent") == "update_people":
         start_update_people_session(chat_guid, sender, text, intent)
+    elif intent and intent.get("intent") == "query_calendar":
+        handle_calendar_query(chat_guid, sender, text, intent)
     else:
         handle_general_message(chat_guid, sender, text)
 
@@ -638,6 +642,39 @@ def finalize_people_update(chat_guid: str, sender: str, event: dict, action: str
     else:
         send_message(chat_guid, f"Couldn't update People Involved — check the Notion connection.")
     sessions.pop(sender, None)
+
+
+# ── CALENDAR QUERY ─────────────────────────────────────────────
+
+def handle_calendar_query(chat_guid: str, sender: str, text: str, intent: dict):
+    days_ahead = intent.get("days_ahead") or 7
+    events = get_upcoming_events(days_ahead=days_ahead)
+
+    if not events:
+        send_message(chat_guid, "Nothing on your calendar for that period!")
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    event_lines = []
+    for e in events:
+        date = e["scheduled"][:10] if e.get("scheduled") else "?"
+        line = f"{date}: {e['name']} ({e['type']})"
+        if e.get("location"):
+            line += f" @ {e['location']}"
+        event_lines.append(line)
+
+    events_text = "\n".join(event_lines)
+    system = f"""You are Rocky, a personal AI assistant on iMessage. Today is {today}.
+
+The user asked: "{text}"
+
+Here are their upcoming calendar events:
+{events_text}
+
+Reply in a friendly, concise iMessage style. Group by day if there are multiple events. Keep it readable on a phone screen."""
+
+    response = get_claude_response(system, [{"role": "user", "content": text}], model="claude-haiku-4-5")
+    send_message(chat_guid, response)
 
 
 # ── GENERAL ────────────────────────────────────────────────────
