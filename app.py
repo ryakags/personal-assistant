@@ -4,7 +4,7 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks, search_contacts, update_people_involved, get_upcoming_events
+from notion_client_wrapper import search_events, write_event_notes, create_calendar_event, append_page_blocks, search_contacts, update_people_involved, get_upcoming_events, create_contact
 from claude_client import get_claude_response
 
 logging.basicConfig(level=logging.INFO)
@@ -182,7 +182,7 @@ def handle_message(chat_guid: str, sender: str, text: str):
     if session.get("state") == "selecting_event_for_edit":
         handle_edit_page_response(chat_guid, sender, text, session)
         return
-    if session.get("state") in ("updating_people", "selecting_event_for_people", "selecting_contact_for_people"):
+    if session.get("state") in ("updating_people", "selecting_event_for_people", "selecting_contact_for_people", "creating_contact"):
         handle_update_people_response(chat_guid, sender, text, session)
         return
 
@@ -576,21 +576,29 @@ def resolve_contact_for_event(chat_guid: str, sender: str, event: dict, action: 
     contacts = search_contacts(contact_name)
 
     if not contacts:
-        send_message(chat_guid, f"I couldn't find anyone named {contact_name} in your contacts.")
+        sessions[sender] = {
+            "state": "creating_contact",
+            "contact_name": contact_name,
+            "event": event,
+            "action": action,
+            "chat_guid": chat_guid
+        }
+        send_message(chat_guid, f"No contact found for {contact_name}. Want me to create a new one?")
         return
 
     if len(contacts) == 1:
         finalize_people_update(chat_guid, sender, event, action, contacts[0])
     else:
+        top = contacts[:3]
         contact_list = "\n".join([
             f"{i+1}. {c['name']}" + (f" (last saw {c['last_saw'][:10]})" if c.get('last_saw') else "")
-            for i, c in enumerate(contacts[:5])
+            for i, c in enumerate(top)
         ])
         sessions[sender] = {
             "state": "selecting_contact_for_people",
             "event": event,
             "action": action,
-            "contacts": contacts[:5],
+            "contacts": top,
             "chat_guid": chat_guid
         }
         send_message(chat_guid, f"Which {contact_name}?\n\n{contact_list}")
@@ -621,6 +629,19 @@ def handle_update_people_response(chat_guid: str, sender: str, text: str, sessio
                 send_message(chat_guid, "Please reply with a number from the list.")
         except ValueError:
             send_message(chat_guid, "Please reply with the number of the contact.")
+        return
+
+    if state == "creating_contact":
+        if text.strip().lower() in ("yes", "y", "yeah", "yep", "sure", "yup", "ok", "okay"):
+            contact = create_contact(session["contact_name"])
+            if contact:
+                finalize_people_update(chat_guid, sender, session["event"], session["action"], contact)
+            else:
+                send_message(chat_guid, "Couldn't create the contact — check the Notion connection.")
+                sessions.pop(sender, None)
+        else:
+            send_message(chat_guid, "Got it, skipping.")
+            sessions.pop(sender, None)
         return
 
 

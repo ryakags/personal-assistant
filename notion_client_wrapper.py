@@ -228,6 +228,30 @@ def search_contacts(name_query: str) -> list:
         return []
 
 
+def create_contact(name: str) -> dict | None:
+    try:
+        response = httpx.post(
+            "https://api.notion.com/v1/pages",
+            headers=_headers(),
+            json={
+                "parent": {"database_id": CONTACTS_DB_ID},
+                "properties": {
+                    "Name": {
+                        "title": [{"type": "text", "text": {"content": name}}]
+                    }
+                }
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        page = response.json()
+        logger.info(f"Created contact: {name}")
+        return {"id": page["id"], "name": name, "last_saw": None}
+    except Exception as e:
+        logger.error(f"Error creating contact: {e}", exc_info=True)
+        return None
+
+
 def update_people_involved(event_page_id: str, contact_ids: list) -> bool:
     """Update the People Involved relation on a calendar event."""
     try:
