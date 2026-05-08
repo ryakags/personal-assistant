@@ -216,6 +216,15 @@ def webhook():
 def handle_message(chat_guid: str, sender: str, text: str):
     session = sessions.get(sender, {})
 
+    # Global cancel command
+    if text.strip().lower() in ("cancel", "stop", "nevermind", "never mind"):
+        if session:
+            sessions.pop(sender, None)
+            send_message(chat_guid, "Cancelled.")
+        else:
+            send_message(chat_guid, "Nothing active to cancel.")
+        return
+
     # Continue active sessions
     if session.get("state") in ("recapping", "selecting_event_for_recap"):
         handle_recap_response(chat_guid, sender, text, session)
@@ -344,6 +353,7 @@ def handle_recap_response(chat_guid: str, sender: str, text: str, session: dict)
     else:
         session["messages"].append(text)
         sessions[sender] = session
+        logger.info(f"Recap: collected message #{len(session['messages'])} for {session['event']['name']}")
 
 
 def finalize_recap(chat_guid: str, sender: str, session: dict):
@@ -820,6 +830,7 @@ def handle_contact_note_response(chat_guid: str, sender: str, text: str, session
     else:
         session["messages"].append(text)
         sessions[sender] = session
+        logger.info(f"Contact note: collected message #{len(session['messages'])} for {session['contact']['name']}")
 
 
 def finalize_contact_note(chat_guid: str, sender: str, session: dict):
