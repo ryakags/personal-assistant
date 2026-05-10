@@ -1,14 +1,30 @@
 import os
+import sys
 import json
 import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-from claude_client import get_claude_response
-from notion_tools import NOTION_TOOLS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+logger.info("=== Rocky starting up ===")
+logger.info(f"Python {sys.version}")
+
+try:
+    from claude_client import get_claude_response
+    logger.info("claude_client imported OK")
+except Exception as e:
+    logger.error(f"FAILED to import claude_client: {e}")
+    raise
+
+try:
+    from notion_tools import NOTION_TOOLS
+    logger.info(f"notion_tools imported OK — {len(NOTION_TOOLS)} tools")
+except Exception as e:
+    logger.error(f"FAILED to import notion_tools: {e}")
+    raise
 
 app = Flask(__name__)
 
