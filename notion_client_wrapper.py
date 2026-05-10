@@ -479,6 +479,78 @@ def write_contact_summary(contact_id: str, bullets: list) -> bool:
     return replace_section(contact_id, "Summary", blocks)
 
 
+def query_calendar(date_from: str = None, date_to: str = None, event_type: str = None, name_query: str = None) -> list:
+    """
+    Unified calendar query used by Notion tools. Always returns people_ids + resolves names.
+    Falls back to next-7-days if no date params given.
+    """
+    today = datetime.now()
+    start = date_from or today.strftime("%Y-%m-%d")
+    end = date_to or (today + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    filters = [
+        {"property": "Scheduled", "date": {"on_or_after": start}},
+        {"property": "Scheduled", "date": {"on_or_before": end}},
+    ]
+    if event_type:
+        filters.append({"property": "Type of Event", "select": {"equals": event_type}})
+
+    body = {
+        "filter": {"and": filters},
+        "sorts": [{"property": "Scheduled", "direction": "ascending"}],
+        "page_size": 20,
+    }
+
+    try:
+        response = httpx.post(
+            f"https://api.notion.com/v1/databases/{CALENDAR_DB_ID}/query",
+            headers=_headers(),
+            json=body,
+            timeout=10,
+        )
+        response.raise_for_status()
+        results = response.json().get("results", [])
+
+        events = []
+        for page in results:
+            props = page.get("properties", {})
+            name = "".join(t.get("plain_text", "") for t in props.get("Name", {}).get("title", []))
+
+            if name_query and name_query.lower() not in name.lower():
+                continue
+
+            scheduled_prop = props.get("Scheduled", {}).get("date", {})
+            scheduled = scheduled_prop.get("start", "") if scheduled_prop else ""
+
+            type_prop = props.get("Type of Event", {}).get("select", {})
+            event_type_val = type_prop.get("name", "") if type_prop else ""
+
+            location_prop = props.get("Location", {})
+            location = "".join(t.get("plain_text", "") for t in location_prop.get("rich_text", []))
+
+            people_rel = props.get("People Involved", {}).get("relation", [])
+            people_ids = [p.get("id") for p in people_rel]
+
+            # Resolve contact names inline so Claude doesn't need a second tool call
+            people = get_contacts_by_ids(people_ids) if people_ids else []
+
+            events.append({
+                "id": page["id"],
+                "name": name,
+                "scheduled": scheduled,
+                "type": event_type_val,
+                "location": location,
+                "people_ids": people_ids,
+                "people": people,
+            })
+
+        return events
+
+    except Exception as e:
+        logger.error(f"Error in query_calendar: {e}", exc_info=True)
+        return []
+
+
 def get_todays_events() -> list:
     """Get today's events - kept for backwards compatibility."""
     today = datetime.now().strftime("%Y-%m-%d")
