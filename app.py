@@ -243,6 +243,11 @@ def handle_message(chat_guid: str, sender: str, text: str, user_info: dict):
     send_message(chat_guid, response_text)
 
 
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"ok": True, "status": "running"})
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "status": "running"})
