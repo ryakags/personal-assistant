@@ -37,9 +37,13 @@ BLUEBUBBLES_PASSWORD = os.environ.get("BLUEBUBBLES_PASSWORD", "")
 # role "family" → friendly Rocky assistant, no Notion tools
 # ---------------------------------------------------------------------------
 ALLOWED_USERS = {
-    "+19168331436": {"name": "Ryan", "role": "owner"},
-    # "+1XXXXXXXXXX": {"name": "Mom",   "role": "family"},
-    # "+1XXXXXXXXXX": {"name": "Dad",   "role": "family"},
+    "+19168331436": {"name": "Ryan",   "role": "owner"},
+    "+19166125209": {"name": "Dad",    "role": "family"},
+    "+19166125208": {"name": "Mom",    "role": "family"},
+    "+15593205995": {"name": "Kacy",   "role": "family"},
+    "+19167536161": {"name": "Andrew", "role": "family"},
+    "+19164796911": {"name": "Daniel", "role": "family"},
+    "+13474806820": {"name": "Diana",  "role": "family"},
 }
 
 # sender -> {"messages": [{role, content}, ...], "chat_guid": str}
