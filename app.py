@@ -28,16 +28,30 @@ except Exception as e:
 
 app = Flask(__name__)
 
-MY_NUMBER = "+19168331436"
 BLUEBUBBLES_URL = os.environ.get("BLUEBUBBLES_URL", "http://localhost:1234")
 BLUEBUBBLES_PASSWORD = os.environ.get("BLUEBUBBLES_PASSWORD", "")
+
+# ---------------------------------------------------------------------------
+# Allowed users — add family members here.
+# role "owner"  → full Notion access + Ryan-specific prompt
+# role "family" → friendly Rocky assistant, no Notion tools
+# ---------------------------------------------------------------------------
+ALLOWED_USERS = {
+    "+19168331436": {"name": "Ryan", "role": "owner"},
+    # "+1XXXXXXXXXX": {"name": "Mom",   "role": "family"},
+    # "+1XXXXXXXXXX": {"name": "Dad",   "role": "family"},
+}
 
 # sender -> {"messages": [{role, content}, ...], "chat_guid": str}
 sessions = {}
 
 MAX_HISTORY = 30  # cap conversation history per sender
 
-SYSTEM_PROMPT = """You are Rocky, Ryan Kageyama's personal AI assistant over iMessage. Be helpful, concise, and punchy — this is iMessage, not email. Keep responses short and phone-screen friendly.
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
+
+OWNER_SYSTEM_PROMPT = """You are Rocky, Ryan Kageyama's personal AI assistant over iMessage. Be helpful, concise, and punchy — this is iMessage, not email. Keep responses short and phone-screen friendly.
 
 TODAY: {today}
 
@@ -91,6 +105,14 @@ CONTACT UPDATE (triggered by "update [name]", "add notes about [name]", "update 
 - If the user sends something clearly off-topic during accumulation (e.g. asks a question), reply: "Still in [recap/update] mode — send 'done' to finish or 'cancel' to exit."
 - Web search: use it for current events, news, sports scores, weather, stock prices
 - Keep all responses short"""
+
+FAMILY_SYSTEM_PROMPT = """You are Rocky, an AI assistant available to the Kageyama family over iMessage. Be warm, helpful, and concise — this is iMessage, not email. Keep responses short and phone-screen friendly.
+
+TODAY: {today}
+
+You can help with questions, quick research, writing, brainstorming, math, recommendations, and general conversation. You have web search available for current events, weather, sports scores, news, and anything that needs up-to-date info.
+
+Keep responses friendly and to the point."""
 
 
 def send_message(chat_guid: str, text: str):
@@ -148,8 +170,9 @@ def webhook():
         return jsonify({"ok": True})
 
     sender = extract_sender_number(data)
-    if not sender or sender != MY_NUMBER:
-        logger.info(f"Ignoring message from: {sender}")
+    user_info = ALLOWED_USERS.get(sender)
+    if not sender or not user_info:
+        logger.info(f"Ignoring message from unlisted number: {sender}")
         return jsonify({"ok": True})
 
     chat_guid = extract_chat_guid(data)
@@ -158,7 +181,7 @@ def webhook():
         return jsonify({"ok": True})
 
     try:
-        handle_message(chat_guid, sender, text)
+        handle_message(chat_guid, sender, text, user_info)
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
         send_message(chat_guid, "Sorry, something went wrong. Try again?")
@@ -166,7 +189,7 @@ def webhook():
     return jsonify({"ok": True})
 
 
-def handle_message(chat_guid: str, sender: str, text: str):
+def handle_message(chat_guid: str, sender: str, text: str, user_info: dict):
     # Global cancel
     if text.strip().lower() in ("cancel", "stop", "nevermind", "never mind"):
         if sender in sessions:
@@ -181,9 +204,17 @@ def handle_message(chat_guid: str, sender: str, text: str):
     session["chat_guid"] = chat_guid
     session["messages"].append({"role": "user", "content": text})
 
-    # Build system prompt with today's date
     today = datetime.now().strftime("%Y-%m-%d")
-    system = SYSTEM_PROMPT.replace("{today}", today)
+    role = user_info.get("role", "family")
+
+    # Owner: full Notion tools + owner prompt
+    # Family: web search only, family prompt
+    if role == "owner":
+        system = OWNER_SYSTEM_PROMPT.replace("{today}", today)
+        notion_tools = NOTION_TOOLS
+    else:
+        system = FAMILY_SYSTEM_PROMPT.replace("{today}", today)
+        notion_tools = None
 
     # Determine whether web search is needed (quick keyword check — no extra API call)
     web_search_keywords = ("weather", "score", "news", "stock", "price", "today in", "latest", "current", "who won", "search")
@@ -193,7 +224,7 @@ def handle_message(chat_guid: str, sender: str, text: str):
         system_prompt=system,
         messages=session["messages"],
         enable_web_search=needs_web_search,
-        notion_tools=NOTION_TOOLS,
+        notion_tools=notion_tools,
     )
 
     session["messages"].append({"role": "assistant", "content": response_text})
