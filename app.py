@@ -5,6 +5,7 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ except Exception as e:
 
 try:
     from notion_tools import NOTION_TOOLS
+    from notion_client_wrapper import query_calendar
     logger.info(f"notion_tools imported OK — {len(NOTION_TOOLS)} tools")
 except Exception as e:
     logger.error(f"FAILED to import notion_tools: {e}")
@@ -28,11 +30,16 @@ except Exception as e:
 
 app = Flask(__name__)
 
+EST = ZoneInfo("America/New_York")
+
 BLUEBUBBLES_URL = os.environ.get("BLUEBUBBLES_URL", "http://localhost:1234")
 BLUEBUBBLES_PASSWORD = os.environ.get("BLUEBUBBLES_PASSWORD", "")
 
+RYAN_PHONE = "+19168331436"
+RYAN_CHAT_GUID = "any;-;+19168331436"
+
 # ---------------------------------------------------------------------------
-# Allowed users — add family members here.
+# Allowed users
 # role "owner"  → full Notion access + Ryan-specific prompt
 # role "family" → friendly Rocky assistant, no Notion tools
 # ---------------------------------------------------------------------------
@@ -49,7 +56,7 @@ ALLOWED_USERS = {
 # sender -> {"messages": [{role, content}, ...], "chat_guid": str}
 sessions = {}
 
-MAX_HISTORY = 30  # cap conversation history per sender
+MAX_HISTORY = 30
 
 # ---------------------------------------------------------------------------
 # System prompts
@@ -58,6 +65,7 @@ MAX_HISTORY = 30  # cap conversation history per sender
 OWNER_SYSTEM_PROMPT = """You are Rocky, Ryan Kageyama's personal AI assistant over iMessage. Be helpful, concise, and punchy — this is iMessage, not email. Keep responses short and phone-screen friendly.
 
 TODAY: {today}
+TIMEZONE: All times are Eastern (EST/EDT).
 
 You have access to Ryan's Notion calendar and contacts database via the notion_* tools.
 
@@ -66,18 +74,32 @@ Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation, Lunch, Party, Coffe
 
 --- CAPABILITIES ---
 
-CALENDAR QUERY: Use notion_query_calendar with date_from/date_to for date ranges.
+CALENDAR QUERY: Use notion_query_calendar with date_from/date_to for date ranges. Always display times in EST.
 - Future queries: date_from=today, date_to=N days out
 - Past queries: date_from=N days ago, date_to=today
 
 ADD TO CALENDAR: Collect name, date, and event_type (infer what you can). Confirm once, then notion_create_calendar_event.
 
-EDIT EVENT PAGE: Find event with notion_query_calendar, then notion_append_to_page.
+EDIT EVENT: Find event with notion_query_calendar, then notion_update_event (name, date, type, or location).
+
+DELETE EVENT: Find event with notion_query_calendar, confirm with user, then notion_delete_event.
+
+EDIT EVENT PAGE: notion_append_to_page for adding notes to the page body.
 
 UPDATE PEOPLE INVOLVED:
 1. notion_query_calendar to get the event (includes current people_ids + names)
 2. notion_search_contacts to find the contact
 3. notion_update_event_people with the full updated list of contact IDs
+
+--- NUMBERED EVENT REFERENCES ---
+
+When a numbered event list has been shown (e.g. in the morning briefing or after a calendar query), the user may refer to events by number:
+- "delete 2" → delete event #2
+- "1 move to tomorrow" → update event #1's date
+- "add notes to 3" → append notes to event #3
+- "who's coming to 1" → check/update people on event #1
+
+Always use the most recently shown numbered list to resolve references. If the list is ambiguous or expired, re-query the calendar and show a fresh numbered list.
 
 --- MULTI-TURN FLOWS ---
 
@@ -121,6 +143,25 @@ If this appears to be the start of a conversation (first message), introduce you
 Keep responses friendly and to the point."""
 
 
+def now_est() -> datetime:
+    return datetime.now(EST)
+
+
+def today_est() -> str:
+    return now_est().strftime("%Y-%m-%d")
+
+
+def format_event_time(scheduled: str) -> str:
+    """Convert a Notion datetime string to h:MM AM/PM EST. Returns '' for date-only."""
+    if not scheduled or "T" not in scheduled:
+        return ""
+    try:
+        dt = datetime.fromisoformat(scheduled.replace("Z", "+00:00"))
+        return dt.astimezone(EST).strftime("%-I:%M %p")
+    except Exception:
+        return ""
+
+
 def send_message(chat_guid: str, text: str):
     url = f"{BLUEBUBBLES_URL}/api/v1/message/text"
     payload = {
@@ -157,6 +198,43 @@ def extract_chat_guid(data: dict) -> str | None:
         return chats[0].get("guid", "") if chats else None
     except Exception:
         return None
+
+
+def send_morning_briefing():
+    """Query today's Notion events and send Ryan his daily briefing at 9:30am EST."""
+    logger.info("Running morning briefing")
+    today = today_est()
+
+    try:
+        events = query_calendar(date_from=today, date_to=today)
+    except Exception as e:
+        logger.error(f"Morning briefing: failed to query calendar: {e}")
+        events = []
+
+    if events:
+        lines = [f"Good morning! Here's your day ({today}):"]
+        for i, event in enumerate(events, 1):
+            time_str = format_event_time(event.get("scheduled", ""))
+            line = f"{i}. {event['name']}"
+            if time_str:
+                line += f" at {time_str}"
+            if event.get("location"):
+                line += f" @ {event['location']}"
+            lines.append(line)
+        lines.append("\nReply with a number + action to update, delete, or add notes.")
+        message = "\n".join(lines)
+    else:
+        message = f"Good morning! Nothing on the calendar for today ({today}) — anything going on?"
+
+    # Seed the session so Claude has context when Ryan replies
+    session = sessions.setdefault(RYAN_PHONE, {"messages": [], "chat_guid": RYAN_CHAT_GUID})
+    session["chat_guid"] = RYAN_CHAT_GUID
+    session["messages"].append({"role": "assistant", "content": message})
+    if len(session["messages"]) > MAX_HISTORY:
+        session["messages"] = session["messages"][-MAX_HISTORY:]
+
+    send_message(RYAN_CHAT_GUID, message)
+    logger.info("Morning briefing sent")
 
 
 @app.route("/webhook", methods=["POST"])
@@ -205,16 +283,13 @@ def handle_message(chat_guid: str, sender: str, text: str, user_info: dict):
             send_message(chat_guid, "Nothing active to cancel.")
         return
 
-    # Get or create session
     session = sessions.setdefault(sender, {"messages": [], "chat_guid": chat_guid})
     session["chat_guid"] = chat_guid
     session["messages"].append({"role": "user", "content": text})
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = today_est()
     role = user_info.get("role", "family")
 
-    # Owner: full Notion tools + owner prompt
-    # Family: web search only, family prompt
     if role == "owner":
         system = OWNER_SYSTEM_PROMPT.replace("{today}", today)
         notion_tools = NOTION_TOOLS
@@ -222,7 +297,6 @@ def handle_message(chat_guid: str, sender: str, text: str, user_info: dict):
         system = FAMILY_SYSTEM_PROMPT.replace("{today}", today)
         notion_tools = None
 
-    # Determine whether web search is needed (quick keyword check — no extra API call)
     web_search_keywords = ("weather", "score", "news", "stock", "price", "today in", "latest", "current", "who won", "search")
     needs_web_search = any(kw in text.lower() for kw in web_search_keywords)
 
@@ -235,7 +309,6 @@ def handle_message(chat_guid: str, sender: str, text: str, user_info: dict):
 
     session["messages"].append({"role": "assistant", "content": response_text})
 
-    # Keep history bounded
     if len(session["messages"]) > MAX_HISTORY:
         session["messages"] = session["messages"][-MAX_HISTORY:]
 
@@ -251,6 +324,26 @@ def index():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "status": "running"})
+
+
+# ---------------------------------------------------------------------------
+# Scheduler — 9:30 AM EST daily briefing
+# ---------------------------------------------------------------------------
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        send_morning_briefing,
+        CronTrigger(hour=9, minute=30, timezone=EST),
+        id="morning_briefing",
+        replace_existing=True,
+    )
+    scheduler.start()
+    logger.info("Scheduler started — morning briefing at 9:30 AM EST")
+except Exception as e:
+    logger.error(f"Failed to start scheduler: {e}")
 
 
 if __name__ == "__main__":

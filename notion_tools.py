@@ -9,6 +9,8 @@ import logging
 from notion_client_wrapper import (
     query_calendar,
     create_calendar_event,
+    update_calendar_event,
+    delete_calendar_event,
     search_contacts,
     create_contact,
     update_people_involved,
@@ -106,6 +108,32 @@ NOTION_TOOLS = [
         },
     },
     {
+        "name": "notion_update_event",
+        "description": "Update an existing Notion calendar event's name, date, type, or location.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id":   {"type": "string", "description": "Notion page ID of the event"},
+                "name":       {"type": "string", "description": "New event name"},
+                "date":       {"type": "string", "description": "New ISO date, e.g. '2026-06-01'"},
+                "event_type": {"type": "string", "description": "New event type"},
+                "location":   {"type": "string", "description": "New location (pass empty string to clear)"},
+            },
+            "required": ["event_id"],
+        },
+    },
+    {
+        "name": "notion_delete_event",
+        "description": "Archive (delete) a Notion calendar event by its page ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "Notion page ID of the event to delete"},
+            },
+            "required": ["event_id"],
+        },
+    },
+    {
         "name": "notion_write_recap_to_event",
         "description": "Write (or replace) a Recap section on a calendar event page.",
         "input_schema": {
@@ -196,6 +224,20 @@ def execute_notion_tool(name: str, input_data: dict) -> str:
         elif name == "notion_create_contact":
             contact = create_contact(input_data["name"])
             return json.dumps(contact) if contact else "error: failed to create contact"
+
+        elif name == "notion_update_event":
+            ok = update_calendar_event(
+                page_id=input_data["event_id"],
+                name=input_data.get("name"),
+                date=input_data.get("date"),
+                event_type=input_data.get("event_type"),
+                location=input_data.get("location"),
+            )
+            return "success" if ok else "error: failed to update event"
+
+        elif name == "notion_delete_event":
+            ok = delete_calendar_event(input_data["event_id"])
+            return "success" if ok else "error: failed to delete event"
 
         elif name == "notion_update_event_people":
             ok = update_people_involved(input_data["event_id"], input_data["contact_ids"])

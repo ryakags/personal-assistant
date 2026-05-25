@@ -570,6 +570,52 @@ def update_contact(page_id: str, name: str, summary: str, followups: list, event
     pass
 
 
+def update_calendar_event(page_id: str, name: str = None, date: str = None,
+                          event_type: str = None, location: str = None) -> bool:
+    """Update mutable fields on a Notion calendar event."""
+    props = {}
+    if name:
+        props["Name"] = {"title": [{"type": "text", "text": {"content": name}}]}
+    if date:
+        props["Scheduled"] = {"date": {"start": date}}
+    if event_type:
+        props["Type of Event"] = {"select": {"name": event_type}}
+    if location is not None:
+        props["Location"] = {"rich_text": [{"type": "text", "text": {"content": location}}]}
+    if not props:
+        return True
+    try:
+        response = httpx.patch(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=_headers(),
+            json={"properties": props},
+            timeout=10,
+        )
+        response.raise_for_status()
+        logger.info(f"Updated event {page_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error updating event {page_id}: {e}", exc_info=True)
+        return False
+
+
+def delete_calendar_event(page_id: str) -> bool:
+    """Archive (delete) a Notion calendar event."""
+    try:
+        response = httpx.patch(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=_headers(),
+            json={"archived": True},
+            timeout=10,
+        )
+        response.raise_for_status()
+        logger.info(f"Archived event {page_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error deleting event {page_id}: {e}", exc_info=True)
+        return False
+
+
 def create_calendar_event(name: str, date: str, event_type: str, location: str = "", notes: str = "") -> bool:
     """Create a new event in the Notion calendar database."""
     properties = {
