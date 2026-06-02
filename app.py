@@ -325,7 +325,10 @@ def index():
 def sync_calendar():
     try:
         from sync_calendar import sync_gcal_to_notion
-        result = sync_gcal_to_notion()
+        body = request.get_json(silent=True) or {}
+        days_back = int(body.get("days_back", 7))
+        days_ahead = int(body.get("days_ahead", 30))
+        result = sync_gcal_to_notion(days_back=days_back, days_ahead=days_ahead)
         return jsonify({"ok": True, **result})
     except Exception as e:
         logger.error(f"Calendar sync failed: {e}", exc_info=True)
