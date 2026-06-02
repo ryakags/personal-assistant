@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import httpx
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -641,13 +641,22 @@ def find_event_by_gcal_id(gcal_id: str) -> str | None:
         return None
 
 
+def _to_notion_dt(dt_str: str) -> str:
+    """Convert a GCal datetime string to UTC ISO 8601 format for Notion."""
+    dt = datetime.fromisoformat(dt_str)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
 def upsert_gcal_event(gcal_event: dict, page_id: str = None) -> bool:
     """Create or update a Notion calendar page from a GCal event dict."""
     db_id = GCAL_CALENDAR_DB_ID or CALENDAR_DB_ID
 
-    notion_date = {"start": gcal_event["start"]}
-    if not gcal_event["is_all_day"] and gcal_event.get("end"):
-        notion_date["end"] = gcal_event["end"]
+    if gcal_event["is_all_day"]:
+        notion_date = {"start": gcal_event["start"]}
+    else:
+        notion_date = {"start": _to_notion_dt(gcal_event["start"])}
+        if gcal_event.get("end"):
+            notion_date["end"] = _to_notion_dt(gcal_event["end"])
 
     properties = {
         "Name": {"title": [{"type": "text", "text": {"content": gcal_event["title"]}}]},
