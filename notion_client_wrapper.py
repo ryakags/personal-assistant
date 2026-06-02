@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 # Database IDs — read from environment
 CALENDAR_DB_ID = os.environ.get("NOTION_CALENDAR_DB", "")
 CONTACTS_DB_ID = os.environ.get("NOTION_CONTACTS_DB", "")
+GCAL_CALENDAR_DB_ID = os.environ.get("NOTION_CALENDAR_DB_ID", "")
 
 
 def _headers():
@@ -613,6 +614,74 @@ def delete_calendar_event(page_id: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Error deleting event {page_id}: {e}", exc_info=True)
+        return False
+
+
+def find_event_by_gcal_id(gcal_id: str) -> str | None:
+    """Return the Notion page ID for an event with a matching GCal Event ID, or None."""
+    db_id = GCAL_CALENDAR_DB_ID or CALENDAR_DB_ID
+    try:
+        response = httpx.post(
+            f"https://api.notion.com/v1/databases/{db_id}/query",
+            headers=_headers(),
+            json={
+                "filter": {
+                    "property": "GCal Event ID",
+                    "rich_text": {"equals": gcal_id}
+                },
+                "page_size": 1
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        results = response.json().get("results", [])
+        return results[0]["id"] if results else None
+    except Exception as e:
+        logger.error(f"Error querying Notion for GCal event {gcal_id}: {e}", exc_info=True)
+        return None
+
+
+def upsert_gcal_event(gcal_event: dict, page_id: str = None) -> bool:
+    """Create or update a Notion calendar page from a GCal event dict."""
+    db_id = GCAL_CALENDAR_DB_ID or CALENDAR_DB_ID
+
+    notion_date = {"start": gcal_event["start"]}
+    if not gcal_event["is_all_day"] and gcal_event.get("end"):
+        notion_date["end"] = gcal_event["end"]
+
+    properties = {
+        "Name": {"title": [{"type": "text", "text": {"content": gcal_event["title"]}}]},
+        "Scheduled": {"date": notion_date},
+        "GCal Event ID": {"rich_text": [{"type": "text", "text": {"content": gcal_event["id"]}}]},
+    }
+    if gcal_event.get("location"):
+        properties["Location"] = {
+            "rich_text": [{"type": "text", "text": {"content": gcal_event["location"][:2000]}}]
+        }
+    if gcal_event.get("description"):
+        properties["Notes"] = {
+            "rich_text": [{"type": "text", "text": {"content": gcal_event["description"][:2000]}}]
+        }
+
+    try:
+        if page_id:
+            response = httpx.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers=_headers(),
+                json={"properties": properties},
+                timeout=10
+            )
+        else:
+            response = httpx.post(
+                "https://api.notion.com/v1/pages",
+                headers=_headers(),
+                json={"parent": {"database_id": db_id}, "properties": properties},
+                timeout=10
+            )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        logger.error(f"Error upserting GCal event {gcal_event.get('id')} to Notion: {e}", exc_info=True)
         return False
 
 

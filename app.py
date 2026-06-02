@@ -321,6 +321,17 @@ def index():
     return jsonify({"ok": True, "status": "running"})
 
 
+@app.route("/sync-calendar", methods=["POST"])
+def sync_calendar():
+    try:
+        from sync_calendar import sync_gcal_to_notion
+        result = sync_gcal_to_notion()
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        logger.error(f"Calendar sync failed: {e}", exc_info=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "status": "running"})
