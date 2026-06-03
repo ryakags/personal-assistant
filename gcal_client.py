@@ -4,10 +4,19 @@ import logging
 from datetime import datetime, timezone, timedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.discovery_cache.base import Cache
 
 logger = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+
+class _NoCache(Cache):
+    """Disable the file-based discovery cache (avoids write errors on read-only filesystems)."""
+    def get(self, url):
+        return None
+    def set(self, url, content):
+        pass
 
 
 def _get_service():
@@ -17,7 +26,7 @@ def _get_service():
     creds = service_account.Credentials.from_service_account_info(
         json.loads(creds_json), scopes=SCOPES
     )
-    return build("calendar", "v3", credentials=creds)
+    return build("calendar", "v3", credentials=creds, cache=_NoCache())
 
 
 def fetch_events(calendar_id: str = None, days_back: int = 7, days_ahead: int = 30) -> list:
