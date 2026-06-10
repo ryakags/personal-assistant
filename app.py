@@ -44,13 +44,14 @@ RYAN_CHAT_GUID = "any;-;+19168331436"
 # role "family" → friendly Rocky assistant, no Notion tools
 # ---------------------------------------------------------------------------
 ALLOWED_USERS = {
-    "+19168331436": {"name": "Ryan",   "role": "owner"},
-    "+19166125209": {"name": "Dad",    "role": "family"},
-    "+19166125208": {"name": "Mom",    "role": "family"},
-    "+15593205995": {"name": "Kacy",   "role": "family"},
-    "+19167536161": {"name": "Andrew", "role": "family"},
-    "+19164796911": {"name": "Daniel", "role": "family"},
-    "+13474806820": {"name": "Diana",  "role": "family"},
+    "+19168331436": {"name": "Ryan",   "role": "owner",  "tz": "America/New_York"},
+    "+18583542737": {"name": "Kelley", "role": "friend", "tz": "Europe/Madrid"},   # abroad in Barcelona — switch back when home
+    "+19166125209": {"name": "Dad",    "role": "family", "tz": "America/Los_Angeles"},
+    "+19166125208": {"name": "Mom",    "role": "family", "tz": "America/Los_Angeles"},
+    "+15593205995": {"name": "Kacy",   "role": "family", "tz": "America/Los_Angeles"},
+    "+19167536161": {"name": "Andrew", "role": "family", "tz": "America/Los_Angeles"},
+    "+19164796911": {"name": "Daniel", "role": "family", "tz": "America/Los_Angeles"},
+    "+13474806820": {"name": "Diana",  "role": "family", "tz": "America/New_York"},
 }
 
 # sender -> {"messages": [{role, content}, ...], "chat_guid": str}
@@ -64,8 +65,7 @@ MAX_HISTORY = 30
 
 OWNER_SYSTEM_PROMPT = """You are Rocky, Ryan Kageyama's personal AI assistant over iMessage. Be helpful, concise, and punchy — this is iMessage, not email. Keep responses short and phone-screen friendly.
 
-TODAY: {today}
-TIMEZONE: All times are Eastern (EST/EDT).
+NOW: {now}
 
 You have access to Ryan's Notion calendar and contacts database via the notion_* tools.
 
@@ -74,7 +74,7 @@ Exercise, Dinner, Concert, Reminder, Comedy, Call, Vacation, Lunch, Party, Coffe
 
 --- CAPABILITIES ---
 
-CALENDAR QUERY: Use notion_query_calendar with date_from/date_to for date ranges. Always display times in EST.
+CALENDAR QUERY: Use notion_query_calendar with date_from/date_to for date ranges. Derive today's date from the NOW timestamp above.
 - Future queries: date_from=today, date_to=N days out
 - Past queries: date_from=N days ago, date_to=today
 
@@ -129,16 +129,16 @@ CONTACT UPDATE (triggered by "update [name]", "add notes about [name]", "update 
 - For People Involved updates: always fetch the current list from the event before adding/removing
 - During note accumulation (between starting a recap/contact flow and "done"): send ONLY "👍"
 - If the user sends something clearly off-topic during accumulation (e.g. asks a question), reply: "Still in [recap/update] mode — send 'done' to finish or 'cancel' to exit."
-- Web search: use it for current events, news, sports scores, weather, stock prices
+- Web search: use it for current events, recent news, sports scores, weather, prices, or anything time-sensitive or that may have changed since your training cutoff
 - Keep all responses short"""
 
 FAMILY_SYSTEM_PROMPT = """You are Rocky, an AI assistant available to the Kageyama family over iMessage. Be warm, helpful, and concise — this is iMessage, not email. Keep responses short and phone-screen friendly.
 
-TODAY: {today}
+NOW: {now}
 
-You can help with questions, quick research, writing, brainstorming, math, recommendations, and general conversation. You have web search available for current events, weather, sports scores, news, and anything that needs up-to-date info.
+You can help with questions, quick research, writing, brainstorming, math, recommendations, and general conversation. You have web search available. Use it for current events, recent news, sports scores, weather, prices, or anything time-sensitive or that may have changed since your training cutoff.
 
-If this appears to be the start of a conversation (first message), introduce yourself briefly — e.g. "Hey, Rocky here! How can I help?" — then answer their question.
+SEARCH GUIDANCE: Always anchor searches to the current date from the NOW timestamp above. Include the current month and year in queries when looking for recent news, prices, hours, events, or availability — this ensures results are current, not outdated. For example, search "best restaurants Lisbon June 2026" not just "best restaurants Lisbon".
 
 Keep responses friendly and to the point."""
 
@@ -287,23 +287,23 @@ def handle_message(chat_guid: str, sender: str, text: str, user_info: dict):
     session["chat_guid"] = chat_guid
     session["messages"].append({"role": "user", "content": text})
 
-    today = today_est()
+    tz_name = user_info.get("tz", "America/Los_Angeles")
+    user_tz = ZoneInfo(tz_name)
+    local_now = datetime.now(user_tz)
+    now_str = local_now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
+
     role = user_info.get("role", "family")
 
     if role == "owner":
-        system = OWNER_SYSTEM_PROMPT.replace("{today}", today)
+        system = OWNER_SYSTEM_PROMPT.replace("{now}", now_str)
         notion_tools = NOTION_TOOLS
     else:
-        system = FAMILY_SYSTEM_PROMPT.replace("{today}", today)
+        system = FAMILY_SYSTEM_PROMPT.replace("{now}", now_str)
         notion_tools = None
-
-    web_search_keywords = ("weather", "score", "news", "stock", "price", "today in", "latest", "current", "who won", "search")
-    needs_web_search = any(kw in text.lower() for kw in web_search_keywords)
 
     response_text = get_claude_response(
         system_prompt=system,
         messages=session["messages"],
-        enable_web_search=needs_web_search,
         notion_tools=notion_tools,
     )
 

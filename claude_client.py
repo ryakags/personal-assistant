@@ -9,27 +9,26 @@ CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
+
+def _web_search_tool(model: str) -> dict:
+    max_uses = 3 if "haiku" in model else 5
+    return {"type": "web_search_20250305", "name": "web_search", "max_uses": max_uses}
 
 
 def get_claude_response(
     system_prompt: str,
     messages: list,
     model: str = DEFAULT_MODEL,
-    enable_web_search: bool = False,
     notion_tools: list = None,
 ) -> str:
     headers = {
         "x-api-key": CLAUDE_API_KEY,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
+        "anthropic-beta": "web-search-2025-03-05",
     }
-    if enable_web_search:
-        headers["anthropic-beta"] = "web-search-2025-03-05"
 
-    tools = []
-    if enable_web_search:
-        tools.append(WEB_SEARCH_TOOL)
+    tools = [_web_search_tool(model)]
     if notion_tools:
         tools.extend(notion_tools)
 
@@ -57,6 +56,7 @@ def get_claude_response(
             logger.info(f"Claude [{model}] stop_reason={stop_reason}, blocks={len(content)}")
 
             if stop_reason != "tool_use":
+                # Only extract text blocks — skip web_search_tool_result and other block types
                 texts = [b["text"] for b in content if b.get("type") == "text"]
                 return " ".join(texts) if texts else "Sorry, I couldn't get a response."
 
